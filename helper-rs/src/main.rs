@@ -683,10 +683,41 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             let window = resolve_window(state, params)?;
             prepare_input(state, &window, WindowUse::Captured)?;
             overlay::show();
-            interrupt::mark_synthetic(0.3);
             // Official `type_text` accepts an empty string: the schema requires the
             // key to be present, not to be non-empty (TC-11).
-            input::paste_text(&require_text_allow_empty(params, "text")?)?;
+            let text = require_text_allow_empty(params, "text")?;
+            if text.is_empty() {
+                return Ok(json!({}));
+            }
+            // F2: `type_text` is a clipboard paste (Ctrl+V). Verify target-scoped:
+            // dump the target window and check the text actually landed, regardless
+            // of where focus is (robust to the overlay / foreground-lock no-op). The
+            // focused control's value is a secondary signal for controls whose text
+            // is not in the window dump. If it did not land, re-assert foreground and
+            // retry once; if it still did not, return an error instead of a silent ok.
+            let hwnd = hwnd_from_id(window.id);
+            let wid = window.id as isize;
+            let before_fv = uia::global().focused_value_opt();
+            let _ = activate_hwnd(hwnd);
+            interrupt::mark_synthetic(0.3);
+            input::paste_text(&text)?;
+            if !text_landed(wid, &text, &before_fv) {
+                let _ = activate_hwnd(hwnd);
+                interrupt::mark_synthetic(0.3);
+                input::paste_text(&text)?;
+                if !text_landed(wid, &text, &before_fv) {
+                    // Last resort: post WM_PASTE straight to the focused control of
+                    // the target's GUI thread. This bypasses SendInput and helps the
+                    // classic Win32 EDIT case; it does not apply to WinUI/XAML and
+                    // cannot cross a UIPI integrity boundary.
+                    let _ = input::paste_text_via_postmessage(wid, &text);
+                    if !text_landed(wid, &text, &before_fv) {
+                        return Err(Error::desktop(
+                            "type_text did not land in the target window; click into the target field first, then retry",
+                        ));
+                    }
+                }
+            }
             Ok(json!({}))
         }
         "press_key" => {
@@ -720,6 +751,24 @@ fn prepare_input(state: &Mutex<HelperState>, window: &WindowRef, use_: WindowUse
         activate_hwnd(hwnd)?;
     }
     Ok(())
+}
+
+/// F2 landing check. Primary: the typed text is present in the target window's
+/// accessibility dump (target-scoped, so it works even when the window is not
+/// foreground — robust to the overlay / foreground-lock no-op). Secondary: the
+/// focused control's value changed since before the paste, which covers controls
+/// whose text is not exposed in the window dump.
+fn text_landed(wid: isize, text: &str, before_fv: &Option<String>) -> bool {
+    if uia::global().window_contains(wid, text).unwrap_or(false) {
+        return true;
+    }
+    // Secondary: only when we have a concrete readable value both before and after
+    // and it actually changed to a non-empty value. Never treat "unreadable before,
+    // readable after" as landed — that is just focus moving to an empty control.
+    match (before_fv, &uia::global().focused_value_opt()) {
+        (Some(b), Some(a)) => a != b && !a.is_empty(),
+        _ => false,
+    }
 }
 
 fn flag(params: &Map<String, Value>, key: &str, default: bool) -> bool {

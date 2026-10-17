@@ -782,6 +782,14 @@ enum Job {
     Diagnostics {
         resp: Sender<serde_json::Value>,
     },
+    FocusedValue {
+        resp: Sender<UiaResult<Option<String>>>,
+    },
+    WindowContains {
+        hwnd: isize,
+        needle: String,
+        resp: Sender<UiaResult<bool>>,
+    },
 }
 
 pub struct UiaClient {
@@ -858,6 +866,39 @@ impl UiaClient {
             })
             .map_err(|_| "send set value request to accessibility monitor".to_string())?;
         resp_rx.recv().map_err(|_| "wait for accessibility set value".to_string())?
+    }
+
+    pub fn focused_value(&self) -> UiaResult<Option<String>> {
+        wait_window_opened_ready()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::FocusedValue { resp: resp_tx })
+            .map_err(|_| "send focused value request to accessibility monitor".to_string())?;
+        resp_rx.recv().map_err(|_| "wait for accessibility focused value".to_string())?
+    }
+
+    /// Best-effort focused-control value: `None` when there is no focused element or
+    /// it exposes no readable value (so callers can distinguish "unchanged" from
+    /// "cannot verify").
+    pub fn focused_value_opt(&self) -> Option<String> {
+        self.focused_value().ok().flatten()
+    }
+
+    /// Target-scoped landing check: dump the target window and report whether
+    /// `needle` appears in any node's value or name. Works even when the window is
+    /// not foreground, so it can confirm a paste landed (or detect it did not)
+    /// regardless of where keyboard focus is.
+    pub fn window_contains(&self, hwnd: isize, needle: &str) -> UiaResult<bool> {
+        wait_window_opened_ready()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::WindowContains {
+                hwnd,
+                needle: needle.to_string(),
+                resp: resp_tx,
+            })
+            .map_err(|_| "send window contains request to accessibility monitor".to_string())?;
+        resp_rx.recv().map_err(|_| "wait for accessibility window contains".to_string())?
     }
 
     pub fn secondary(&self, hwnd: isize, index: i32, action: &str) -> UiaResult<()> {
@@ -1143,6 +1184,30 @@ fn monitor_loop(rx: Receiver<Job>) {
                 }
                 let _ = resp.send(diagnostics_payload(engine.as_ref()));
             }
+            Job::FocusedValue { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_value() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::WindowContains { hwnd, needle, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.window_contains(hwnd, &needle) })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
             },
             Err(RecvTimeoutError::Timeout) => {
                 let mut msg = MSG::default();
@@ -1181,6 +1246,12 @@ fn fail_job(job: Job, err: &str) {
             let mut payload = diagnostics_payload(None);
             payload["error"] = serde_json::json!(err);
             let _ = resp.send(payload);
+        }
+        Job::FocusedValue { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::WindowContains { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
         }
     }
 }
@@ -1656,6 +1727,38 @@ impl Engine {
         Err(format!("{NO_CACHED_APP_STATE}{}", self.process_name))
     }
 
+    /// Dump the target window and report whether `needle` appears in any node's
+    /// value or name. Target-scoped: works even when the window is not foreground,
+    /// so it can confirm a paste landed (or detect it did not) regardless of where
+    /// keyboard focus is. Coordinate origin/scale are irrelevant to a text search,
+    /// so dummy values are used.
+    unsafe fn window_contains(&mut self, hwnd: isize, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        match self.dump(hwnd, "", (0.0, 0.0), 1.0) {
+            Ok(dump) => dump
+                .nodes
+                .iter()
+                .any(|n| n.value.contains(needle) || n.name.contains(needle)),
+            Err(_) => false,
+        }
+    }
+
+    /// Read the live value of the currently focused control, but only when it
+    /// exposes a readable ValuePattern. `None` means "no focused control" or
+    /// "focused control has no readable value" — callers must not treat that as
+    /// "unchanged".
+    unsafe fn focused_value(&mut self) -> Option<String> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        pattern::<IUIAutomationValuePattern>(&el, UIA_ValuePatternId)?;
+        Some(value_of(&el))
+    }
+
     unsafe fn set_value(&mut self, hwnd: isize, index: i32, value: &str) -> UiaResult<()> {
         let el = self.cached_element(hwnd, index)?;
         el.SetFocus().map_err(|_| FOCUS_BEFORE_SET_VALUE.to_string())?;
@@ -1671,6 +1774,24 @@ impl Engine {
             }
             let bstr = BSTR::from(value);
             pat.SetValue(&bstr).map_err(|_| "set UIA value".to_string())?;
+            // F2 (known limitation, NOT fully closeable via UIA): some controls —
+            // notably the Win11 Notepad WinUI RichEditBox — report SetValue success
+            // and write the new value into the UIA value model while the real control
+            // is unchanged. The echo is transient but outlasts any practical delay, so
+            // BOTH CurrentValue() and a fresh window dump read back the written value
+            // and cannot detect the no-op. Closing this needs a non-UIA check or
+            // accepting set_value as unreliable on such controls (prefer type_text,
+            // and let the model's own vision verify the result). The readback below
+            // still catches providers that fail WITHOUT echoing.
+            if pat.CurrentValue().ok().map(bstr_to_string).as_deref() != Some(value) {
+                let _ = crate::input::paste_text(value);
+                if pat.CurrentValue().ok().map(bstr_to_string).as_deref() != Some(value) {
+                    return Err(
+                        "set_value reported success but the control's value did not change"
+                            .to_string(),
+                    );
+                }
+            }
             return Ok(());
         }
         if let Some(rng) = pattern::<IUIAutomationRangeValuePattern>(&el, UIA_RangeValuePatternId) {

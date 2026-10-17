@@ -3,7 +3,7 @@
 use crate::enum_windows::{exe_name, window_pid, window_title};
 use crate::overlay;
 use crate::protocol::Error;
-use windows::Win32::Foundation::{GetLastError, HANDLE, HWND, POINT};
+use windows::Win32::Foundation::{GetLastError, HANDLE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -16,7 +16,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetClassNameW, GetSystemMetrics, GetWindow, WindowFromPoint, GA_ROOT,
+    GetAncestor, GetClassNameW, GetGUIThreadInfo, GetSystemMetrics, GetWindow,
+    GetWindowThreadProcessId, PostMessageW, WindowFromPoint, GUITHREADINFO, WM_PASTE, GA_ROOT,
     GA_ROOTOWNER, GW_OWNER, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
@@ -350,6 +351,38 @@ pub fn paste_text(text: &str) -> Result<(), Error> {
     }
     set_and_verify_clipboard(text)?;
     press_key("Control_L+v")
+}
+
+/// Foreground- and hook-independent paste: set the clipboard, then post
+/// `WM_PASTE` straight to the focused control of `window_hwnd`'s GUI thread.
+/// This bypasses `SendInput` entirely, so it is a fallback for the classic
+/// Win32 EDIT case where a `SendInput` Ctrl+V does not land. It does NOT apply
+/// to WinUI/XAML controls (no Win32 `WM_PASTE`), and it cannot cross a UIPI
+/// integrity boundary — a higher-IL target rejects input from this Low-IL
+/// helper regardless of path.
+pub fn paste_text_via_postmessage(window_hwnd: isize, text: &str) -> Result<(), Error> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    set_and_verify_clipboard(text)?;
+    let hwnd = as_hwnd(window_hwnd);
+    if hwnd.0.is_null() {
+        return Err(Error::desktop("paste target window handle is null"));
+    }
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, None);
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let focus = if GetGUIThreadInfo(tid, &mut info).is_ok() && !info.hwndFocus.0.is_null() {
+            info.hwndFocus
+        } else {
+            hwnd
+        };
+        let _ = PostMessageW(Some(focus), WM_PASTE, WPARAM(0), LPARAM(0));
+    }
+    Ok(())
 }
 
 pub fn type_unicode(text: &str) -> Result<(), Error> {
