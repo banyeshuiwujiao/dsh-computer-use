@@ -263,9 +263,16 @@ class FakeBrowser:
                 payload["screenshot_unavailable"] = tab.screenshot_unavailable
             else:
                 png = solid_png()
-                payload["screenshots"] = [{"id": f"{tab.id}-shot", "emitted": False, "bytes": len(png)}]
+                b64 = base64.b64encode(png).decode("ascii")
+                payload["screenshots"] = [
+                    {
+                        "id": f"{tab.id}-shot",
+                        "emitted": False,
+                        "bytes": len(png),
+                        "url": f"data:image/png;base64,{b64}",
+                    }
+                ]
                 payload["screenshot_bytes"] = len(png)
-                payload["_png"] = base64.b64encode(png).decode("ascii")
         return payload
 
     def ax_click(self, tab_id: str, index: int) -> dict[str, object]:

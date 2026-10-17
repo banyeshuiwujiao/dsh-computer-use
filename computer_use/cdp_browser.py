@@ -136,9 +136,20 @@ class CdpBrowser:
             shot = tab.conn.call("Page.captureScreenshot", {"format": "png"})
             b64 = str(shot.get("data") or "")
             raw = base64.b64decode(b64) if b64 else b""
-            payload["screenshots"] = [{"id": f"{tab.id}-shot", "emitted": False, "bytes": len(raw)}]
+            # Carry the PNG as a data-URL inside the screenshot entry so
+            # images.detach_images harvests it into the top-level images[]
+            # (the vision channel). A non-empty screenshots[] list makes
+            # detach_images skip the payload node and only recurse into the
+            # list, so the bytes must live on the entry, not a top-level key.
+            payload["screenshots"] = [
+                {
+                    "id": f"{tab.id}-shot",
+                    "emitted": False,
+                    "bytes": len(raw),
+                    "url": f"data:image/png;base64,{b64}",
+                }
+            ]
             payload["screenshot_bytes"] = len(raw)
-            payload["_png"] = b64
         return payload
 
     def ax_click(self, tab_id: str, index: int) -> dict[str, object]:
