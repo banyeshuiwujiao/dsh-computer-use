@@ -63,6 +63,7 @@ function makeHarness(options = {}) {
       if (surface === 'computer') return { tools: options.desktopTools || DESKTOP_13 }
       const extras = [
         { name: 'batch_actions', description: 'batch', parameters: {} },
+        { name: 'scroll_element', description: 'scroll element', parameters: {} },
         { name: 'diagnostic_state', description: 'diag', parameters: {} },
         { name: 'end_turn', description: 'end', parameters: {} },
       ]
@@ -672,7 +673,7 @@ test('host and tool configs validate and default to the official surface', () =>
   const tool = ToolConfig({})
   assert.deepEqual(tool.surfaces, ['computer'])
   assert.equal(tool.approvalDefault, 'prompt')
-  assert.deepEqual(tool.enabledTools, ['batch_actions'])
+  assert.deepEqual(tool.enabledTools, ['batch_actions', 'scroll_element'])
   assert.deepEqual(tool.approvalTools, {})
 })
 
@@ -769,7 +770,8 @@ test('MCP-02/07/12 health exposes the server instruction, catalog, docs and env 
   assert.equal(health.codexRequired, false)
   assert.equal(health.backend, 'fake')
   assert.ok(health.tools.exposed.includes('get_window_state'))
-  assert.deepEqual(health.tools.enabled, ['batch_actions'])
+  assert.ok(health.tools.exposed.includes('scroll_element'), 'F4: scroll_element must be discoverable in the model-facing catalog')
+  assert.deepEqual(health.tools.enabled, ['batch_actions', 'scroll_element'])
   assert.equal(health.approval.default, 'prompt')
   assert.ok(health.documentation.references.includes('guidance.md'))
   assert.equal(health.promptAssets.ok, true)

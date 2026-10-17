@@ -87,7 +87,12 @@ export const Config = Schema.object({
    * (`session_note/session_state/diagnostic_state`) and `end_turn` stay out of
    * the catalog unless named here.
    */
-  enabledTools: Schema.array(Schema.string()).default(['batch_actions']),
+  // batch_actions and scroll_element are on by default because the always-present
+  // `scroll` / `batch_actions` descriptions tell the model to use `scroll_element`
+  // for indexed scrolling; a tool the guidance names must also be discoverable.
+  // It is a harness-surface extension, so the official native `computer` surface
+  // stays exactly 13. Diagnostic tools and end_turn stay opt-in.
+  enabledTools: Schema.array(Schema.string()).default(['batch_actions', 'scroll_element']),
 })
 
 const OUTPUT_SCHEMA = {
