@@ -515,6 +515,10 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                 "observation": st.lease_snapshot(),
                 "pipe": pipe::current_name(),
                 "computerUseEnabled": policy::computer_use_enabled(),
+                "integrity": {
+                    "helperRid": uia::integrity_rid(std::process::id()),
+                    "helperLabel": uia::integrity_label(uia::integrity_rid(std::process::id())),
+                },
                 "capture": {"wgcFramePool": capture::wgc_available(), "jpeg": true, "cachedSessionCount": capture::cached_session_count()},
                 "dpi": {"aware": true, "scale": dpi::dpi_scale(dpi::window_dpi(hwnd_from_id(0)))},
             }))
@@ -671,6 +675,10 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
             secondary(state, params)
         }
+        "select_text" => {
+            state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
+            select_text(state, params)
+        }
         "click" | "click_element" => {
             state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
             click(state, params, method)
@@ -750,6 +758,20 @@ fn prepare_input(state: &Mutex<HelperState>, window: &WindowRef, use_: WindowUse
     if !is_already_foreground(hwnd) {
         activate_hwnd(hwnd)?;
     }
+    Ok(())
+}
+
+/// UIA-pattern actions (perform_secondary_action / native select_text) don't need
+/// foreground focus. Activating the target here would emit a focus event and
+/// invalidate the very element cache the action is about to use, producing
+/// "no cached app state is available for <app>". Keep the freshness/policy
+/// checks but skip activation.
+fn prepare_uia_target(state: &Mutex<HelperState>, window: &WindowRef) -> Result<(), Error> {
+    let hwnd = hwnd_from_id(window.id);
+    let st = state.lock().map_err(|_| Error::other("state lock"))?;
+    st.require_fresh()?;
+    st.require_window_use(window.id, WindowUse::Captured)?;
+    policy::deny_target(&window.app, hwnd, &st.allowed_apps).map_err(Error::desktop)?;
     Ok(())
 }
 
@@ -1071,6 +1093,15 @@ fn diagnostic_state(state: &Mutex<HelperState>) -> Result<Value, Error> {
             body["processId"] = json!(pid);
         }
         body["aumid"] = json!(policy::process_aumid(pid));
+        let helper_rid = uia::integrity_rid(std::process::id());
+        let target_rid = if pid != 0 { uia::integrity_rid(pid) } else { None };
+        body["integrity"] = json!({
+            "helperRid": helper_rid,
+            "helperLabel": uia::integrity_label(helper_rid),
+            "targetRid": target_rid,
+            "targetLabel": uia::integrity_label(target_rid),
+            "targetHigher": matches!((target_rid, helper_rid), (Some(t), Some(h)) if t > h),
+        });
         if hwnd != 0 {
             if let Ok((x, y, width, height)) = window_rect(hwnd_from_id(hwnd)) {
                 body["bounds"] = json!({ "x": x, "y": y, "width": width, "height": height });
@@ -1153,18 +1184,70 @@ fn set_value(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<
 
 fn secondary(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
     let window = resolve_window(state, params)?;
-    prepare_input(state, &window, WindowUse::Captured)?;
+    prepare_uia_target(state, &window)?;
     let index = json_i64(params, "element_index")?.ok_or_else(|| Error::type_err("element_index is required"))? as i32;
     let action = require_text(params, "action")?;
-    uia::global()
-        .secondary(window.id as isize, index, &action)
-        .map_err(|e| {
-            if e.contains("has no cached") || e.contains("unsupported secondary") {
-                Error::key(e)
-            } else {
-                Error::desktop(e)
+    // Rebuild the UIA element cache immediately before the pattern call. Focus
+    // and foreground events (including the observation overlay) bump the
+    // invalidation generation, which clears the cached IUIAutomationElement map;
+    // a UIA pattern action does not need a new observation, but it does need the
+    // cached element, so refresh without activating the window.
+    let hwnd = hwnd_from_id(window.id);
+    if let Ok((ox, oy, _w, _h)) = window_rect(hwnd) {
+        let dpi = dpi::window_dpi(hwnd);
+        let scale = dpi::dpi_scale(dpi);
+        let _ = uia::global().dump(window.id as isize, &window.title, (ox as f64, oy as f64), scale);
+    }
+    match uia::global().secondary(window.id as isize, index, &action) {
+        Ok(()) => Ok(json!({})),
+        Err(e) => {
+            // Some providers (notably Win11 Notepad's RichEditBox) advertise
+            // Scroll Up/Down but return an error from IUIAutomationScrollPattern.
+            // Fall back to a real wheel scroll at the element center, matching
+            // the coordinate scroll path.
+            let key = action.trim().to_ascii_lowercase();
+            let scroll_key = matches!(key.as_str(), "scroll up" | "scroll down" | "scroll left" | "scroll right");
+            if scroll_key && e.contains("perform UIA secondary action") {
+                if let Ok(bounds) = uia::global().cached_bounds(index) {
+                    let (px, py) = bounds.center();
+                    let delta = 600.0;
+                    let (sx, sy) = match key.as_str() {
+                        "scroll up" => (0.0, -delta),
+                        "scroll down" => (0.0, delta),
+                        "scroll left" => (-delta, 0.0),
+                        _ => (delta, 0.0),
+                    };
+                    overlay::show();
+                    let _ = overlay::position_for(&action, px as f32, py as f32, false);
+                    input::scroll_at(px, py, sx, sy)?;
+                    return Ok(json!({}));
+                }
             }
-        })?;
+            let msg = format!("[rust-secondary] {e}");
+            if e.contains("has no cached") || e.contains("unsupported secondary") {
+                Err(Error::key(msg))
+            } else {
+                Err(Error::desktop(msg))
+            }
+        }
+    }
+}
+
+fn select_text(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
+    let window = resolve_window(state, params)?;
+    prepare_uia_target(state, &window)?;
+    let index = json_i64(params, "element_index")?
+        .ok_or_else(|| Error::type_err("element_index is required"))? as i32;
+    let text = require_text(params, "text")?;
+    let hwnd = hwnd_from_id(window.id);
+    if let Ok((ox, oy, _w, _h)) = window_rect(hwnd) {
+        let dpi = dpi::window_dpi(hwnd);
+        let scale = dpi::dpi_scale(dpi);
+        let _ = uia::global().dump(window.id as isize, &window.title, (ox as f64, oy as f64), scale);
+    }
+    uia::global()
+        .select_text(window.id as isize, index, &text)
+        .map_err(Error::desktop)?;
     Ok(json!({}))
 }
 

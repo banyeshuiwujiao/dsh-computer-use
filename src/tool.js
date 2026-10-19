@@ -522,8 +522,23 @@ function experienceTool(state) {
 
 function makeSidecarTool(ctx, spec, config, state, options) {
   const parameters = spec.parameters && typeof spec.parameters === 'object'
-    ? spec.parameters
+    ? JSON.parse(JSON.stringify(spec.parameters))
     : { type: 'object', properties: {}, additionalProperties: true }
+  if (spec.name === 'click') {
+    if (parameters.properties && !parameters.properties.text) {
+      parameters.properties.text = {
+        description: 'Optional element text or name to click (automatically matches element_index from latest get_window_state accessibility tree).',
+        type: 'string',
+      }
+    }
+  } else if (spec.name === 'set_value' || spec.name === 'perform_secondary_action') {
+    if (parameters.properties && !parameters.properties.text) {
+      parameters.properties.text = {
+        description: 'Optional element text or name to target (automatically matches element_index from latest get_window_state accessibility tree).',
+        type: 'string',
+      }
+    }
+  }
   const base = spec.description || spec.name
   const description = options?.descriptionPrefix ? `${options.descriptionPrefix}\n\n${base}` : base
   return {
@@ -547,7 +562,19 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       },
     },
     async execute(args, exec) {
-      const input = args && typeof args === 'object' ? args : {}
+      const input = args && typeof args === 'object' ? { ...args } : {}
+      const targetText = typeof input.text === 'string' ? input.text.trim() : ''
+      if (targetText && input.element_index === undefined && (input.x === undefined || input.y === undefined)) {
+        if (state.lastElements && state.lastElements.length > 0) {
+          const matched = state.lastElements.find(e => e.name && e.name.toLowerCase().includes(targetText.toLowerCase()))
+            || state.lastElements.find(e => e.raw && e.raw.toLowerCase().includes(targetText.toLowerCase()))
+          if (matched) {
+            input.element_index = matched.index
+          }
+        }
+      }
+      delete input.text
+
       const required = REQUIRED_DOCS[spec.name]
       if (required) {
         const missing = required.filter(doc => !documentWasRead(state.readDocuments, doc))
@@ -580,6 +607,9 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         throw error
       }
       const value = result?.value ?? result
+      if (spec.name === 'get_window_state' && value?.accessibility?.tree) {
+        state.lastElements = extractInteractiveElements(value.accessibility.tree)
+      }
       recordCall(state, spec.name, input, turnMeta, startedAt, value)
       const refs = await admitImages(ctx, result?.images || [])
       const digest = digestForCall(state, spec.name, turnMeta, value)
@@ -808,12 +838,83 @@ function notApprovedMessage(subject) {
   return `Computer Use was not approved to use ${subject}`
 }
 
+/**
+ * Extract interactive elements from an accessibility tree for compact inspection.
+ * @param {string} treeText
+ * @returns {Array<{ index: number, role: string, name: string, raw: string }>}
+ */
+export function extractInteractiveElements(treeText) {
+  if (!treeText || typeof treeText !== 'string') return []
+  const lines = treeText.split('\n')
+  const elements = []
+  const regex = /^\t*(\d+)\s+([^\s]+)(?:\s+(.+))?$/
+  for (const line of lines) {
+    const match = regex.exec(line)
+    if (!match) continue
+    const index = parseInt(match[1], 10)
+    const role = match[2]
+    const rest = match[3] || ''
+    const isInteractive = /按钮|选项卡|选项卡项目|菜单项|链接|复选框|单选按钮|编辑|组合框|列表项目|button|tab|tabitem|menuitem|link|checkbox|radiobutton|edit|combobox|listitem/i.test(role)
+    if (isInteractive) {
+      elements.push({ index, role, name: rest.trim(), raw: line.trim() })
+    }
+  }
+  return elements
+}
+
+/**
+ * Format WindowState body with an interactive element summary and trimmed document_text
+ * to prevent context explosion and DSH middle-pruning while preserving JSON structure.
+ * @param {object} body
+ * @returns {string}
+ */
+export function formatWindowStateBody(body) {
+  if (!body || typeof body !== 'object') return stringifyCompact(body)
+  const ax = body.accessibility
+  if (!ax || typeof ax !== 'object') return stringifyCompact(body)
+
+  let summary = ''
+  if (typeof ax.tree === 'string' && ax.tree.length > 0) {
+    const elems = extractInteractiveElements(ax.tree)
+    if (elems.length > 0) {
+      const summaryLines = [
+        `=== Interactive Elements (${elems.length} found; use element_index with click/set_value) ===`,
+      ]
+      for (const el of elems.slice(0, 60)) {
+        summaryLines.push(`[${el.index}] ${el.role} "${el.name}"`)
+      }
+      if (elems.length > 60) {
+        summaryLines.push(`... [${elems.length - 60} more interactive elements in tree]`)
+      }
+      summary = summaryLines.join('\n') + '\n\n'
+    }
+  }
+
+  let safeBody = body
+  if (typeof ax.document_text === 'string' && ax.document_text.length > 600) {
+    const total = ax.document_text.length
+    const trimmed =
+      ax.document_text.slice(0, 250) +
+      `\n... [document_text trimmed: ${total} total characters to prevent middle pruning; see tree for structure] ...\n` +
+      ax.document_text.slice(-150)
+    safeBody = {
+      ...body,
+      accessibility: {
+        ...ax,
+        document_text: trimmed,
+      },
+    }
+  }
+
+  return summary + stringifyCompact(safeBody)
+}
+
 function renderValue(value) {
   const record = value && typeof value === 'object' ? value : { value }
   const body = record.value === undefined ? record : record.value
   const blocks = []
   if (body !== null && body !== undefined) {
-    blocks.push({ type: 'text', text: stringifyCompact(body) })
+    blocks.push({ type: 'text', text: formatWindowStateBody(body) })
   }
   for (const attachment of Array.isArray(record.images) ? record.images : []) {
     if (attachment && attachment.attachmentId) {

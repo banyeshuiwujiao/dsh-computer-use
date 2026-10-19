@@ -127,7 +127,8 @@ a `Selected:` list, `Selected text:` / `Document text:` fenced blocks, and the s
 
 ## Recommendations
 
-- Prefer `element_index` over guessed coordinates whenever an accessibility element is available.
+- Prefer `element_index` or `text` over guessed coordinates whenever an accessibility element is available.
+- `click({window, text: "按钮名称"})` will automatically match the target element from the latest accessibility tree.
 - Coordinates are window-relative **logical** pixels; a screenshot's `originX`/`originY` are **screen** coordinates. Do not mix them.
 - Do not run `pwsh`, OCR, or PrintWindow to \"see\" the UI: the screenshot is an image part you can already read.
 

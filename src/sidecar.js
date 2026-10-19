@@ -327,6 +327,7 @@ const NATIVE_CALLS = new Set([
   'set_value',
   'drag',
   'perform_secondary_action',
+  'select_text',
   'activate_window',
   'batch_actions',
   'session_note',

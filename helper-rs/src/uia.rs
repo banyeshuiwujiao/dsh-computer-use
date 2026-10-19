@@ -764,6 +764,12 @@ enum Job {
         action: String,
         resp: Sender<UiaResult<()>>,
     },
+    SelectText {
+        hwnd: isize,
+        index: i32,
+        text: String,
+        resp: Sender<UiaResult<()>>,
+    },
     Scroll {
         hwnd: isize,
         index: i32,
@@ -913,6 +919,20 @@ impl UiaClient {
             })
             .map_err(|_| "send secondary action request to accessibility monitor".to_string())?;
         resp_rx.recv().map_err(|_| "wait for accessibility secondary action".to_string())?
+    }
+
+    pub fn select_text(&self, hwnd: isize, index: i32, text: &str) -> UiaResult<()> {
+        wait_window_opened_ready()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::SelectText {
+                hwnd,
+                index,
+                text: text.to_string(),
+                resp: resp_tx,
+            })
+            .map_err(|_| "send select text request to accessibility monitor".to_string())?;
+        resp_rx.recv().map_err(|_| "wait for accessibility select text".to_string())?
     }
 
     pub fn scroll(&self, hwnd: isize, index: i32, direction: &str, pages: i32) -> UiaResult<()> {
@@ -1137,9 +1157,26 @@ fn monitor_loop(rx: Receiver<Job>) {
             } => {
                 let result = match engine.as_mut() {
                     Some(eng) => {
-                        eng.apply_invalidate();
+                        // Do not invalidate before a UIA-pattern action: a focus event
+                        // emitted by window activation would clear the element cache
+                        // and turn a valid indexed action into "no cached app state".
+                        // cached_element still validates the runtime id and pid.
                         unsafe { eng.secondary(hwnd, index, &action) }
                     }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::SelectText {
+                hwnd,
+                index,
+                text,
+                resp,
+            } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => unsafe { eng.select_text(hwnd, index, &text) },
                     None => Err(setup_err
                         .clone()
                         .unwrap_or_else(|| CREATE_UIA.to_string())),
@@ -1233,7 +1270,10 @@ fn fail_job(job: Job, err: &str) {
                 let _ = resp.send(Ok(fallback_dump(hwnd, &title, origin, scale)));
             }
         }
-        Job::SetValue { resp, .. } | Job::Secondary { resp, .. } | Job::Scroll { resp, .. } => {
+        Job::SetValue { resp, .. }
+        | Job::Secondary { resp, .. }
+        | Job::SelectText { resp, .. }
+        | Job::Scroll { resp, .. } => {
             let _ = resp.send(Err(err.to_string()));
         }
         Job::CachedBounds { resp, index } => {
@@ -1803,6 +1843,21 @@ impl Engine {
             return Ok(());
         }
         Err(NOT_SETTABLE.to_string())
+    }
+
+    unsafe fn select_text(&mut self, hwnd: isize, index: i32, text: &str) -> UiaResult<()> {
+        let el = self.cached_element(hwnd, index)?;
+        let pat = text_pattern(&el).ok_or_else(|| "element has no text pattern".to_string())?;
+        let range = pat
+            .DocumentRange()
+            .map_err(|_| "get UIA document range".to_string())?;
+        let found = range
+            .FindText(&BSTR::from(text), false, true)
+            .map_err(|_| format!("text not found: {text}"))?;
+        found
+            .Select()
+            .map_err(|_| "select UIA text range".to_string())?;
+        Ok(())
     }
 
     unsafe fn secondary(&mut self, hwnd: isize, index: i32, action: &str) -> UiaResult<()> {
@@ -2495,7 +2550,7 @@ fn fallback_dump(hwnd: isize, title: &str, origin: (f64, f64), scale: f64) -> Ac
     }
 }
 
-fn integrity_rid(pid: u32) -> Option<u32> {
+pub fn integrity_rid(pid: u32) -> Option<u32> {
     unsafe {
         let proc = if pid == GetCurrentProcessId() {
             GetCurrentProcess()
@@ -2535,6 +2590,20 @@ fn integrity_rid(pid: u32) -> Option<u32> {
         } else {
             Some(*rid_ptr)
         }
+    }
+}
+
+/// Human-readable name for the mandatory-integrity RID, used by health and
+/// diagnostic_state so an operator can see why UIA/input is gated.
+pub fn integrity_label(rid: Option<u32>) -> &'static str {
+    match rid {
+        Some(0) => "untrusted",
+        Some(4096) => "low",
+        Some(8192) => "medium",
+        Some(12288) => "high",
+        Some(16384) => "system",
+        Some(_) => "custom",
+        None => "unknown",
     }
 }
 

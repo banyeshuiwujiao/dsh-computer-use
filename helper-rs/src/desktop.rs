@@ -39,6 +39,7 @@ pub fn skip_lock_check(method: &str) -> bool {
             | "list_apps"
             | "get_window"
             | "window"
+            | "launch_app"
     )
 }
 
@@ -88,7 +89,16 @@ fn name_is_lock_desktop(name: &str) -> bool {
 }
 
 pub fn foreground_pid() -> u32 {
-    let hwnd = unsafe { GetForegroundWindow() };
+    let mut hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            hwnd = unsafe { GetForegroundWindow() };
+            if !hwnd.0.is_null() {
+                break;
+            }
+        }
+    }
     if hwnd.0.is_null() {
         return 0;
     }
