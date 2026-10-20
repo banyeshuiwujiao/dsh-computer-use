@@ -64,6 +64,7 @@ function makeHarness(options = {}) {
       const extras = [
         { name: 'batch_actions', description: 'batch', parameters: {} },
         { name: 'scroll_element', description: 'scroll element', parameters: {} },
+        { name: 'fill_form', description: 'fill form', parameters: {} },
         { name: 'diagnostic_state', description: 'diag', parameters: {} },
         { name: 'end_turn', description: 'end', parameters: {} },
       ]
@@ -674,7 +675,7 @@ test('host and tool configs validate and default to the official surface', () =>
   const tool = ToolConfig({})
   assert.deepEqual(tool.surfaces, ['computer'])
   assert.equal(tool.approvalDefault, 'prompt')
-  assert.deepEqual(tool.enabledTools, ['batch_actions', 'scroll_element'])
+  assert.deepEqual(tool.enabledTools, ['batch_actions', 'scroll_element', 'fill_form'])
   assert.deepEqual(tool.approvalTools, {})
 })
 
@@ -772,7 +773,8 @@ test('MCP-02/07/12 health exposes the server instruction, catalog, docs and env 
   assert.equal(health.backend, 'fake')
   assert.ok(health.tools.exposed.includes('get_window_state'))
   assert.ok(health.tools.exposed.includes('scroll_element'), 'F4: scroll_element must be discoverable in the model-facing catalog')
-  assert.deepEqual(health.tools.enabled, ['batch_actions', 'scroll_element'])
+  assert.ok(health.tools.exposed.includes('fill_form'), 'fill_form must be discoverable: multi-field forms are the main round-trip sink')
+  assert.deepEqual(health.tools.enabled, ['batch_actions', 'scroll_element', 'fill_form'])
   assert.equal(health.approval.default, 'prompt')
   assert.ok(health.documentation.references.includes('guidance.md'))
   assert.equal(health.promptAssets.ok, true)
@@ -802,6 +804,75 @@ test('MCP-07 enabledTools controls which harness extensions enter the catalog', 
   const names = [...harness.registered.keys()]
   assert.ok(names.includes('diagnostic_state'))
   assert.equal(names.includes('batch_actions'), false, 'batch_actions is not enabled by this config')
+})
+
+// ── Form-fill / IME / activation ergonomics (2026-10-19) ──────────────────────
+
+test('OPT-1 fill_form is a native call and must not be routed to the Python catalog', async () => {
+  const { usesPython } = await import('../src/sidecar.js')
+  assert.equal(usesPython('call', { name: 'fill_form', arguments: { window: {}, fields: [] } }), false)
+  // A batch that contains fill_form must stay native too.
+  assert.equal(
+    usesPython('call', {
+      name: 'batch_actions',
+      arguments: { actions: [{ name: 'fill_form', arguments: { fields: [] } }] },
+    }),
+    false,
+  )
+})
+
+test('OPT-1 the helper implements fill_form with replace semantics', () => {
+  const main = fs.readFileSync(path.join(pluginRoot, 'helper-rs', 'src', 'main.rs'), 'utf8')
+  assert.match(main, /fn fill_form\(state: &Mutex<HelperState>, params: &Map<String, Value>\)/)
+  assert.match(main, /"fill_form" => \{/)
+  // The coordinate fallback must select-all + paste; a bare paste is the bug.
+  assert.match(main, /input::replace_text_for\(/)
+  assert.doesNotMatch(main, /input::paste_text\(&value\)\?/)
+  // UIA-level fallback too.
+  const uia = fs.readFileSync(path.join(pluginRoot, 'helper-rs', 'src', 'uia.rs'), 'utf8')
+  assert.match(uia, /crate::input::replace_text_for\(/)
+  assert.doesNotMatch(uia, /crate::input::paste_text\(value\)/)
+})
+
+test('OPT-2 fill_form is discoverable in the model-facing catalog', async () => {
+  const harness = makeHarness()
+  await applyTools(harness.ctx, ToolConfig({}))
+  assert.ok(harness.registered.has('fill_form'))
+  const names = [...harness.registered.keys()]
+  assert.ok(names.includes('fill_form'), 'a 2+ field form must be fillable in one call')
+})
+
+test('OPT-3 synthetic keyboard input installs the IME guard on the TARGET window', () => {
+  const input = fs.readFileSync(path.join(pluginRoot, 'helper-rs', 'src', 'input.rs'), 'utf8')
+  const ime = fs.readFileSync(path.join(pluginRoot, 'helper-rs', 'src', 'ime.rs'), 'utf8')
+  // The guard must be installed for the window that receives the keystrokes:
+  // the keyboard layout is per-thread, so an in-process switch is a no-op.
+  assert.match(
+    input,
+    /crate::ime::ImeGuard::install_for\(hwnd\)/,
+    'press_key/type_unicode must suppress the IME on the target window',
+  )
+  // Strip the module docs: they legitimately mention the rejected approach.
+  const code = ime
+    .split(/\r?\n/)
+    .filter(line => !line.trimStart().startsWith('//'))
+    .join('\n')
+  assert.match(code, /ImmAssociateContext/, 'the target IME context must be detached')
+  assert.match(code, /WM_INPUTLANGCHANGEREQUEST/, 'the target thread layout is switched by message')
+  assert.doesNotMatch(code, /ActivateKeyboardLayout/, 'per-process switching does not reach the target')
+  assert.match(code, /impl Drop for ImeGuard/, 'the guard restores the previous state')
+  assert.match(code, /pub fn install_for\(hwnd: Option<isize>\)/)
+})
+
+test('OPT-4 activate_window bumps Z-order before asking for focus', () => {
+  const enum_ = fs.readFileSync(path.join(pluginRoot, 'helper-rs', 'src', 'enum_windows.rs'), 'utf8')
+  assert.match(enum_, /fn bump_to_top\(hwnd: HWND\)/)
+  assert.match(enum_, /HWND_TOPMOST/)
+  assert.match(enum_, /HWND_NOTOPMOST/)
+  assert.ok(
+    enum_.indexOf('bump_to_top(hwnd);') < enum_.indexOf('SetForegroundWindow(hwnd).as_bool()'),
+    'Z-order must be fixed before SetForegroundWindow, otherwise the bump is undone',
+  )
 })
 
 test('P1-6 admitImages harvests top-level images and calls attachments service correctly', async () => {

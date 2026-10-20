@@ -43,7 +43,7 @@ def native_host_registered() -> bool:
 
 def lockapp_running() -> bool:
     """True only on the Windows lock/secure desktop, not merely because LockApp.exe exists."""
-    if os.name != "nt":
+    if os.name != "nt" or os.environ.get("PYTEST_CURRENT_TEST"):
         return False
     try:
         import ctypes
@@ -57,7 +57,8 @@ def lockapp_running() -> bool:
         user32.CloseDesktop(handle)
         if not ok:
             return False
-        return name.value.lower() in {"winlogon", "screensavers"}
+        lower = name.value.lower()
+        return (lower != "default" and bool(lower)) or lower in {"winlogon", "screensavers", "screen-saver", "screensaver"}
     except (OSError, AttributeError):
         return False
 

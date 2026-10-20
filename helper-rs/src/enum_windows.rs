@@ -46,9 +46,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, PeekMessageW, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
     SwitchToThisWindow, SystemParametersInfoW, GA_ROOT, GW_ENABLEDPOPUP, GW_HWNDNEXT, GW_OWNER,
-    GWL_EXSTYLE, GWL_STYLE, MSG, PM_NOREMOVE, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SYSCOMMAND,
+    GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_NOREMOVE, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SYSCOMMAND,
 };
 
 pub const ACTIVATE_CAPTURED_FAILED: &str = "failed to activate captured window";
@@ -990,6 +991,8 @@ fn foreground_is_target(hwnd: HWND) -> bool {
 
 fn steal_foreground(hwnd: HWND) -> bool {
     unsafe {
+        // Z-order before focus: the same maximized-sibling occlusion case.
+        bump_to_top(hwnd);
         let fg = GetForegroundWindow();
         let mut fg_pid = 0u32;
         let fg_tid = GetWindowThreadProcessId(fg, Some(&mut fg_pid));
@@ -1080,6 +1083,35 @@ pub fn is_already_foreground(hwnd: HWND) -> bool {
     is_window(hwnd) && foreground_is_target(hwnd)
 }
 
+/// `HWND_TOPMOST` bump: raise the window above everything, then drop the TOPMOST
+/// flag so it stays a normal window. This is the documented way to beat a
+/// maximized sibling that visually covers the target: `SetForegroundWindow`
+/// alone can report success while the covering window is still on top in
+/// Z-order, which is exactly the "activate_window returned ok but the screenshot
+/// shows another app" failure.
+fn bump_to_top(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
 /// Restore + foreground the captured HWND. Official error: `failed to activate captured window`.
 pub fn activate_hwnd(hwnd: HWND) -> Result<(), Error> {
     if !is_window(hwnd) {
@@ -1114,6 +1146,10 @@ pub fn activate_hwnd(hwnd: HWND) -> Result<(), Error> {
         if is_window_visible(hwnd) {
             clamp_hwnd_to_work_area(hwnd);
         }
+        // Z-order first, focus second. Bumping the window above its maximized
+        // siblings *before* asking for focus is what stops the "activation
+        // succeeded but another window still covers the target" case.
+        bump_to_top(hwnd);
         if SetForegroundWindow(hwnd).as_bool() || foreground_is_target(hwnd) {
             return Ok(());
         }

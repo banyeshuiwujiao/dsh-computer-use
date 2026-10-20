@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   extractInteractiveElements,
   formatWindowStateBody,
+  detectWebDocument,
 } from '../src/tool.js'
 
 test('extractInteractiveElements extracts interactive roles with names and indices', () => {
@@ -56,6 +57,54 @@ test('formatWindowStateBody passes non-accessibility payloads untouched', () => 
   const plain = { ok: true, count: 42 }
   const formatted = formatWindowStateBody(plain)
   assert.deepEqual(JSON.parse(formatted), plain)
+})
+
+test('detectWebDocument identifies browser windows with URLs', () => {
+  const browserBody = {
+    window: { app: 'process:C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', id: 100 },
+    accessibility: {
+      tree: 'Window: "Xueqiu", App: chrome.exe.\n\t50 文档 雪球 Value: https://xueqiu.com/login ID: RootWebArea',
+      focused_element: '50 文档 雪球 Value: https://xueqiu.com/login ID: RootWebArea',
+    },
+  }
+  const detected = detectWebDocument(browserBody)
+  assert.ok(detected)
+  assert.equal(detected.isWeb, true)
+  assert.equal(detected.browser, 'chrome')
+  assert.equal(detected.url, 'https://xueqiu.com/login')
+
+  const desktopBody = {
+    window: { app: 'notepad.exe', id: 200 },
+    accessibility: {
+      tree: 'Window: "Notepad", App: notepad.exe.\n\t1 编辑 Text Editor',
+    },
+  }
+  assert.equal(detectWebDocument(desktopBody), null)
+})
+
+test('formatWindowStateBody injects Smart Router advisory for Web Documents', () => {
+  const webBody = {
+    window: { app: 'chrome.exe', id: 100 },
+    accessibility: {
+      tree: 'Window: "WorkBuddy", App: chrome.exe.\n\t50 文档 WorkBuddy Value: https://workbuddy.cn/login ID: RootWebArea\n\t\t1 编辑 手机号',
+      focused_element: '50 文档 WorkBuddy Value: https://workbuddy.cn/login',
+    },
+  }
+  const formatted = formatWindowStateBody(webBody)
+  assert.match(formatted, /=== Web Document Detected: Smart Router Advisory ===/)
+  assert.match(formatted, /https:\/\/workbuddy\.cn\/login/)
+  assert.match(formatted, /prefer CDP \/ DOM automation/)
+  assert.match(formatted, /=== Interactive Elements \(1 found/)
+
+  const nativeBody = {
+    window: { app: 'calc.exe', id: 300 },
+    accessibility: {
+      tree: 'Window: "Calculator", App: calc.exe.\n\t1 按钮 1',
+    },
+  }
+  const nativeFormatted = formatWindowStateBody(nativeBody)
+  assert.doesNotMatch(nativeFormatted, /Smart Router Advisory/)
+  assert.match(nativeFormatted, /=== Interactive Elements \(1 found/)
 })
 
 test('click tool auto-resolves element_index by target text', async () => {

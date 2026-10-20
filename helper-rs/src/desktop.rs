@@ -81,8 +81,14 @@ pub fn locked_message(name: &str) -> String {
 
 fn name_is_lock_desktop(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
-    lower.contains("winlogon")
+    // On Windows, the only normal user interactive desktop is "Default".
+    // Any input desktop other than "Default" (such as "Screen-saver",
+    // "Winlogon", "Disconnect") is by definition a locked/isolated system desktop.
+    (lower != "default" && !lower.is_empty())
+        || lower.contains("winlogon")
         || lower.contains("screensaver")
+        || lower.contains("screen-saver")
+        || lower.contains("disconnect")
         || lower == "lock"
         || lower.contains("lock screen")
         || lower.contains("windows default")
@@ -139,7 +145,14 @@ fn foreground_is_lock_app(pid: u32) -> bool {
 /// Official `inspect active input desktop`: lock-screen name, then the modern
 /// `LockApp.exe` foreground, then a resolved foreground process id.
 pub fn require_unlocked() -> Result<(), Error> {
-    let name = input_desktop_name()?;
+    let name = match input_desktop_name() {
+        Ok(name) => name,
+        Err(_) => {
+            // When OpenInputDesktop fails (e.g. AccessDenied on a restricted desktop),
+            // the active input desktop is an isolated secure desktop.
+            return Err(Error::desktop(locked_message("SecureDesktop")));
+        }
+    };
     if name_is_lock_desktop(&name) {
         return Err(Error::desktop(locked_message(&name)));
     }
@@ -148,6 +161,16 @@ pub fn require_unlocked() -> Result<(), Error> {
         return Err(Error::desktop(locked_message("LockApp")));
     }
     if pid == 0 {
+        // If foreground pid is 0, check whether LockApp, LogonUI, or a screensaver
+        // is active in the background before giving up with generic FOREGROUND_NO_PID.
+        let lock_pids = crate::enum_windows::pids_matching_keys(&[
+            "lockapp.exe".into(),
+            "logonui.exe".into(),
+            ".scr".into(),
+        ]);
+        if !lock_pids.is_empty() {
+            return Err(Error::desktop(locked_message("LockApp/Screen-saver")));
+        }
         return Err(Error::desktop(FOREGROUND_NO_PID));
     }
     Ok(())
@@ -164,9 +187,27 @@ mod tests {
         assert_eq!(LOCK_APP_EXE, "lockapp.exe");
         assert_eq!(LOCK_APP_CLASS, "Windows.UI.Core.CoreWindow");
         assert!(!name_is_lock_desktop("Default"));
+        assert!(!name_is_lock_desktop("default"));
         assert_eq!(
             locked_message("LockApp"),
             "Windows desktop is locked (input desktop is LockApp); unlock before using computer-use"
+        );
+    }
+
+    #[test]
+    fn screensaver_and_winlogon_are_recognised_as_lock_desktops() {
+        assert!(name_is_lock_desktop("Screen-saver"));
+        assert!(name_is_lock_desktop("screen-saver"));
+        assert!(name_is_lock_desktop("Screensaver"));
+        assert!(name_is_lock_desktop("screensaver"));
+        assert!(name_is_lock_desktop("Winlogon"));
+        assert!(name_is_lock_desktop("winlogon"));
+        assert!(name_is_lock_desktop("Disconnect"));
+        assert!(!name_is_lock_desktop("Default"));
+        assert!(!name_is_lock_desktop("default"));
+        assert_eq!(
+            locked_message("Screen-saver"),
+            "Windows desktop is locked (input desktop is Screen-saver); unlock before using computer-use"
         );
     }
 

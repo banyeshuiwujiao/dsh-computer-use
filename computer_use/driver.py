@@ -193,7 +193,10 @@ class ComputerUse:
         if app:
             deny_allowed_apps(app, self.allowed_apps)
         deny_target(window, self.allowed_apps)
-        if action:
+        # `_lease_ok` is set by composite actions (fill_form) that already
+        # validated the lease once for the whole batch; re-validating per inner
+        # step would fail on any intervening observation of another window.
+        if action and not spec.get("_lease_ok"):
             self.lease.require(spec, action)
             if self.approval and window is not None:
                 self.approval.ensure(window.app, window.app)

@@ -92,7 +92,10 @@ export const Config = Schema.object({
   // for indexed scrolling; a tool the guidance names must also be discoverable.
   // It is a harness-surface extension, so the official native `computer` surface
   // stays exactly 13. Diagnostic tools and end_turn stay opt-in.
-  enabledTools: Schema.array(Schema.string()).default(['batch_actions', 'scroll_element']),
+  // `fill_form` joins the defaults because a multi-field form is the single most
+  // common round-trip sink (each field costs an observe→act→observe cycle), and
+  // the guidance now names it as the preferred path for 2+ field forms.
+  enabledTools: Schema.array(Schema.string()).default(['batch_actions', 'scroll_element', 'fill_form']),
 })
 
 const OUTPUT_SCHEMA = {
@@ -863,6 +866,48 @@ export function extractInteractiveElements(treeText) {
 }
 
 /**
+ * Detect whether the observed window is hosting a Web Document (browser page)
+ * and extract routing facts (URL, browser type) to guide the agent toward
+ * 10x faster CDP/DOM automation instead of blind coordinate clicks.
+ *
+ * @param {object} body
+ * @returns {{ isWeb: boolean, browser: string, url: string | null } | null}
+ */
+export function detectWebDocument(body) {
+  if (!body || typeof body !== 'object') return null
+  const app = String(body.window?.app || '')
+  const appLower = app.toLowerCase()
+  const isBrowser = /chrome|msedge|edge|brave|firefox|opera|vivaldi|chromium/i.test(appLower)
+  const tree = body.accessibility?.tree || ''
+  const focused = body.accessibility?.focused_element || ''
+  const docText = body.accessibility?.document_text || ''
+
+  // Match URL from focused element, accessibility tree, or document_text
+  let url = null
+  const urlRegex = /Value:\s*(https?:\/\/[^\s\n\r"'>]+)/i
+  const match = urlRegex.exec(focused) || urlRegex.exec(tree)
+  if (match) {
+    url = match[1]
+  } else {
+    const textUrlMatch = /(https?:\/\/[^\s\n\r"'>]+)/i.exec(docText)
+    if (textUrlMatch) {
+      url = textUrlMatch[1]
+    }
+  }
+
+  const hasWebArea = /RootWebArea|Chrome_RenderWidgetHostHWND|\b文档\b|\bdocument\b/i.test(tree)
+  if ((isBrowser && (url || hasWebArea)) || (url && hasWebArea)) {
+    const browserName = app.replace(/^process:.*\\/i, '').replace(/\.exe$/i, '')
+    return {
+      isWeb: true,
+      browser: browserName || 'browser',
+      url,
+    }
+  }
+  return null
+}
+
+/**
  * Format WindowState body with an interactive element summary and trimmed document_text
  * to prevent context explosion and DSH middle-pruning while preserving JSON structure.
  * @param {object} body
@@ -872,6 +917,19 @@ export function formatWindowStateBody(body) {
   if (!body || typeof body !== 'object') return stringifyCompact(body)
   const ax = body.accessibility
   if (!ax || typeof ax !== 'object') return stringifyCompact(body)
+
+  let header = ''
+  const webDoc = detectWebDocument(body)
+  if (webDoc) {
+    const urlDisplay = webDoc.url ? ` (${webDoc.url})` : ''
+    header = [
+      `=== Web Document Detected: Smart Router Advisory ===`,
+      `Target window is displaying a Web Document in ${webDoc.browser}${urlDisplay}.`,
+      `• Fast Path (Recommended): For web forms, buttons, links, and data reading, prefer CDP / DOM automation (load skill "computer-use-browser" for tab_* tools or use "cdp-browser-use"). DOM scripts execute in ~0.5s without pixel coordinates, screen capture latency, or IME composition issues.`,
+      `• Native Path: If staying on the desktop surface, use "fill_form" for atomic multi-field input, or use element_index from the summary below.`,
+      `====================================================\n\n`,
+    ].join('\n')
+  }
 
   let summary = ''
   if (typeof ax.tree === 'string' && ax.tree.length > 0) {
@@ -906,7 +964,7 @@ export function formatWindowStateBody(body) {
     }
   }
 
-  return summary + stringifyCompact(safeBody)
+  return header + summary + stringifyCompact(safeBody)
 }
 
 function renderValue(value) {

@@ -661,6 +661,10 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             }))
         }
         "get_window_state" => get_window_state(state, params),
+        "fill_form" => {
+            state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
+            fill_form(state, params)
+        }
         "start_audio_recording" => {
             let duration = StartAudioRecordingParams::from_map(params)?.duration_ms()?;
             audio::start(duration)?;
@@ -708,11 +712,11 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             let before_fv = uia::global().focused_value_opt();
             let _ = activate_hwnd(hwnd);
             interrupt::mark_synthetic(0.3);
-            input::paste_text(&text)?;
+            input::paste_text_for(Some(wid), &text)?;
             if !text_landed(wid, &text, &before_fv) {
                 let _ = activate_hwnd(hwnd);
                 interrupt::mark_synthetic(0.3);
-                input::paste_text(&text)?;
+                input::paste_text_for(Some(wid), &text)?;
                 if !text_landed(wid, &text, &before_fv) {
                     // Last resort: post WM_PASTE straight to the focused control of
                     // the target's GUI thread. This bypasses SendInput and helps the
@@ -735,7 +739,9 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             prepare_input(state, &window, WindowUse::Captured)?;
             overlay::show();
             interrupt::mark_synthetic(0.3);
-            input::press_key(&key)?;
+            // Target the window that will receive the chord: the IME guard needs
+            // the owning thread's layout, not the helper's.
+            input::press_key_for(Some(window.id as isize), &key)?;
             Ok(json!({}))
         }
         "drag" => {
@@ -1148,6 +1154,138 @@ fn batch_actions(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Res
     Ok(json!({"results": results}))
 }
 
+/// `json!` yields `serde_json::Value`; the internal dispatch helpers take
+/// `&Map<String, Value>`. This narrows without cloning when it can.
+fn as_map(value: Value) -> Map<String, Value> {
+    match value {
+        Value::Object(map) => map,
+        other => {
+            let mut map = Map::new();
+            map.insert("_".to_string(), other);
+            map
+        }
+    }
+}
+
+/// Atomic form fill: one call, several field operations, one observation.
+///
+/// Motivation (2026-10-19, WorkBuddy login): filling a three-field login form
+/// through the plain act-and-refresh loop cost 6-8 model round-trips, each one
+/// re-uploading a full screenshot. A `fill_form` collapses that into a single
+/// tool call whose result already contains the post-fill accessibility state.
+///
+/// Semantics are deliberately *replace*, not insert: every `set` runs through
+/// the same `set_value` path (select-all + write + readback verify), so a field
+/// that already holds a stale value can never end up as "old + new".
+///
+/// Steps are ordered and stop at the first failure, unless `continue_on_error`
+/// is set — a half-filled form is easier to report than a silently wrong one.
+fn fill_form(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
+    let window = resolve_window(state, params)?;
+    prepare_input(state, &window, WindowUse::Captured)?;
+    let Some(Value::Array(steps)) = params.get("fields") else {
+        return Err(Error::type_err("fields array required"));
+    };
+    if steps.is_empty() {
+        return Err(Error::type_err("fields array must not be empty"));
+    }
+    let continue_on_error = params
+        .get("continue_on_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Establish (or re-establish) this window's element cache before the first
+    // step. A composite fill often runs right after an observation of a
+    // *different* window (a `batch_actions` refresh, the overlay, a popup); the
+    // per-step `set_value` then fails with "element N has no cached bounds" or
+    // "last get_window_state was window id X" even though the caller did observe
+    // the form. Running the real observation here is what makes `fill_form`
+    // self-sufficient — and it is the same node table the steps then index into.
+    let refresh = json!({
+        "window": window.to_json(),
+        "include_screenshot": false,
+        "include_text": true,
+    });
+    get_window_state(state, &as_map(refresh))?;
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut failed = false;
+
+    for (i, step) in steps.iter().enumerate() {
+        if failed && !continue_on_error {
+            break;
+        }
+        let Some(step) = step.as_object() else {
+            results.push(json!({"ok": false, "index": i, "error": "field entry must be an object"}));
+            failed = true;
+            continue;
+        };
+        // `element_index` is the canonical handle (from get_window_state). `text`
+        // is a convenience that resolves against the last observation.
+        let Some(index) = step.get("element_index").and_then(Value::as_i64) else {
+            results.push(json!({"ok": false, "index": i, "error": "element_index is required"}));
+            failed = true;
+            continue;
+        };
+        let value = step.get("value").and_then(Value::as_str);
+        let kind = step
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or(if value.is_some() { "set" } else { "click" });
+
+        let outcome = match kind {
+            "set" | "value" => {
+                let Some(value) = value else {
+                    return Err(Error::type_err("action \"set\" needs a value"));
+                };
+                set_value(
+                    state,
+                    &as_map(json!({"window": window.to_json(), "element_index": index, "value": value})),
+                )
+            }
+            "check" => dispatch(
+                state,
+                "perform_secondary_action",
+                &as_map(json!({"window": window.to_json(), "element_index": index, "action": "Check"})),
+            ),
+            "click" => dispatch(
+                state,
+                "click",
+                &as_map(json!({"window": window.to_json(), "element_index": index})),
+            ),
+            "press" => {
+                let key = step.get("key").and_then(Value::as_str).unwrap_or("Return");
+                dispatch(
+                    state,
+                    "press_key",
+                    &as_map(json!({"window": window.to_json(), "key": key})),
+                )
+            }
+            other => Err(Error::type_err(format!("unsupported field action: {other}"))),
+        };
+
+        match outcome {
+            Ok(v) => results.push(json!({"ok": true, "index": i, "action": kind, "element_index": index, "value": v})),
+            Err(e) => {
+                results.push(json!({
+                    "ok": false, "index": i, "action": kind, "element_index": index,
+                    "error": e.message,
+                }));
+                failed = true;
+            }
+        }
+    }
+
+    let filled = results.iter().filter(|r| r["ok"] == Value::Bool(true)).count();
+    Ok(json!({
+        "ok": !failed,
+        "fields": results.len(),
+        "filled": filled,
+        "stoppedEarly": failed && !continue_on_error,
+        "results": results,
+    }))
+}
+
 fn set_value(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
     let window = resolve_window(state, params)?;
     prepare_input(state, &window, WindowUse::Captured)?;
@@ -1176,7 +1314,9 @@ fn set_value(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<
             let _ = overlay::position_for("set_value", px as f32, py as f32, true);
             interrupt::mark_synthetic(0.3);
             input::move_click(px, py, "left", 1)?;
-            input::paste_text(&value)?;
+            // Replace, never insert: a bare paste lands at the caret and produces
+            // "old value + new text" instead of the value the caller asked for.
+            input::replace_text_for(Some(window.id as isize), &value)?;
             Ok(json!({}))
         }
     }

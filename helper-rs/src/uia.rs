@@ -1812,6 +1812,7 @@ impl Engine {
             if readonly {
                 return Err(NOT_SETTABLE.to_string());
             }
+            let before = pat.CurrentValue().ok().map(bstr_to_string).unwrap_or_default();
             let bstr = BSTR::from(value);
             pat.SetValue(&bstr).map_err(|_| "set UIA value".to_string())?;
             // F2 (known limitation, NOT fully closeable via UIA): some controls —
@@ -1823,14 +1824,23 @@ impl Engine {
             // accepting set_value as unreliable on such controls (prefer type_text,
             // and let the model's own vision verify the result). The readback below
             // still catches providers that fail WITHOUT echoing.
-            if pat.CurrentValue().ok().map(bstr_to_string).as_deref() != Some(value) {
-                let _ = crate::input::paste_text(value);
+            let echoed = pat.CurrentValue().ok().map(bstr_to_string).unwrap_or_default();
+            if echoed != value {
+                // The provider did not take the write. Reproduce replace semantics:
+                // select-all then paste, never a bare paste (a bare paste appends at
+                // the caret and silently produces "old value + new text").
+                let _ = crate::input::replace_text_for(Some(hwnd), value);
                 if pat.CurrentValue().ok().map(bstr_to_string).as_deref() != Some(value) {
                     return Err(
                         "set_value reported success but the control's value did not change"
                             .to_string(),
                     );
                 }
+            } else if echoed == before && !before.is_empty() && before != value {
+                // Defensive: a provider that echoes the request but never applied it
+                // would look identical to success. Only worth a fallback when the
+                // requested value differs from what was already there.
+                let _ = crate::input::replace_text_for(Some(hwnd), value);
             }
             return Ok(());
         }
@@ -3034,7 +3044,10 @@ mod ax_tests {
     /// shape is pinned by `official_golden_tree_matches_byte_for_byte`.
     #[test]
     fn on_disk_golden_fixture_keeps_the_official_grammar() {
-        let golden = include_str!("../../parity/golden-ax/official.tree.txt");
+        // A Windows checkout writes the fixture with CRLF; the grammar is defined in
+        // terms of LF. Normalising here keeps the test meaningful on both platforms
+        // instead of failing with "AX-06 blank line" on every CRLF clone.
+        let golden = include_str!("../../parity/golden-ax/official.tree.txt").replace("\r\n", "\n");
         assert!(golden.starts_with("Window: \"Parity Target\", App: "), "{golden}");
         let (body, focused) = golden.split_once("\n\n").expect("AX-06 blank line");
         assert!(focused.starts_with("The focused UI element is "), "{focused}");

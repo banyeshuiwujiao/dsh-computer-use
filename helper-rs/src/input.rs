@@ -203,9 +203,66 @@ pub fn require_point_on_target(
     )))
 }
 
+/// Test-only recorder for synthetic input.
+///
+/// `replace_text` / `paste_text` correctness is a *chord-order* property
+/// ("select-all before writing"), which no fake desktop can observe. When the
+/// recorder is armed, `send` captures the keyboard events instead of calling
+/// `SendInput`, so the chord order can be asserted without touching a real
+/// desktop.
+#[cfg(test)]
+thread_local! {
+    static INPUT_RECORDER: std::cell::RefCell<Option<Vec<RecordedInput>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordedInput {
+    vk: u16,
+    scan: u16,
+    key_up: bool,
+    unicode: bool,
+}
+
+#[cfg(test)]
+fn arm_recorder() {
+    INPUT_RECORDER.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+fn disarm_recorder() {
+    INPUT_RECORDER.with(|cell| *cell.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn take_recorded() -> Vec<RecordedInput> {
+    INPUT_RECORDER
+        .with(|cell| cell.borrow_mut().take().unwrap_or_default())
+}
+
 fn send(inputs: &[INPUT]) -> Result<(), Error> {
     if inputs.is_empty() {
         return Ok(());
+    }
+    #[cfg(test)]
+    {
+        if INPUT_RECORDER.with(|cell| cell.borrow().is_some()) {
+            for input in inputs {
+                if input.r#type == INPUT_KEYBOARD {
+                    let ki = unsafe { input.Anonymous.ki };
+                    let flags = ki.dwFlags;
+                    INPUT_RECORDER.with(|cell| {
+                        cell.borrow_mut().as_mut().expect("recorder armed").push(RecordedInput {
+                            vk: ki.wVk.0,
+                            scan: ki.wScan,
+                            key_up: (flags & KEYEVENTF_KEYUP) == KEYEVENTF_KEYUP,
+                            unicode: (flags & KEYEVENTF_UNICODE) == KEYEVENTF_UNICODE,
+                        })
+                    });
+                }
+            }
+            return Ok(());
+        }
     }
     let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
@@ -346,11 +403,45 @@ const CLIPBOARD_VERIFY: &str = "verify clipboard text before paste";
 
 /// Official type_text: set/verify CF_UNICODETEXT then Control+V (rdata CTRLV).
 pub fn paste_text(text: &str) -> Result<(), Error> {
+    paste_text_for(None, text)
+}
+
+/// `paste_text` with an explicit IME-suppression target (the window that will
+/// receive the keystrokes). `None` falls back to the foreground window.
+pub fn paste_text_for(hwnd: Option<isize>, text: &str) -> Result<(), Error> {
     if text.is_empty() {
         return Ok(());
     }
     set_and_verify_clipboard(text)?;
-    press_key("Control_L+v")
+    press_key_for(hwnd, "Control_L+v")
+}
+
+/// Replace the focused control's entire content with `text` (select-all, then paste).
+///
+/// `paste_text` alone *inserts at the caret*, which is what turned a `set_value`
+/// fallback into "old value + one stray character". UIA `ValuePattern::SetValue`
+/// is specified to replace, but when the pattern is missing (or lies about having
+/// applied the write) the coordinate fallback has to reproduce replace semantics
+/// itself. Selecting all first also makes the call idempotent: re-running
+/// `set_value` with the same value can never grow the field.
+///
+/// `Control+A` is only meaningful while the target really has keyboard focus, so
+/// the caller is responsible for clicking into the field (or we focus it via UIA)
+/// before this runs.
+pub fn replace_text(text: &str) -> Result<(), Error> {
+    replace_text_for(None, text)
+}
+
+/// `replace_text` with an explicit IME-suppression target.
+pub fn replace_text_for(hwnd: Option<isize>, text: &str) -> Result<(), Error> {
+    // Empty value is a legitimate way to clear a field (official set_value accepts "").
+    press_key_for(hwnd, "Control_L+a")?;
+    if text.is_empty() {
+        // Delete the selection so "clear the field" actually clears it.
+        return press_key_for(hwnd, "Delete");
+    }
+    set_and_verify_clipboard(text)?;
+    press_key_for(hwnd, "Control_L+v")
 }
 
 /// Foreground- and hook-independent paste: set the clipboard, then post
@@ -386,6 +477,15 @@ pub fn paste_text_via_postmessage(window_hwnd: isize, text: &str) -> Result<(), 
 }
 
 pub fn type_unicode(text: &str) -> Result<(), Error> {
+    type_unicode_for(None, text)
+}
+
+/// `type_unicode` with an explicit IME-suppression target.
+pub fn type_unicode_for(hwnd: Option<isize>, text: &str) -> Result<(), Error> {
+    // `KEYEVENTF_UNICODE` bypasses the IME by construction, but an active IME can
+    // still hold a composition state that swallows the first character, so the
+    // guard is installed anyway — on the *target* window's thread.
+    let _ime = crate::ime::ImeGuard::install_for(hwnd);
     let mut events = Vec::new();
     for ch in text.chars() {
         let mut buf = [0u16; 2];
@@ -470,7 +570,20 @@ fn utf16_zstring(ptr: *const u16) -> Result<String, Error> {
 }
 
 pub fn press_key(chord: &str) -> Result<(), Error> {
+    press_key_for(None, chord)
+}
+
+/// `press_key` with an explicit IME-suppression target.
+///
+/// The guard must target the window that will receive the keystrokes: the layout
+/// is per-thread, and switching the helper's own thread does nothing for a
+/// chord delivered to the target application (see `ime` module docs).
+pub fn press_key_for(hwnd: Option<isize>, chord: &str) -> Result<(), Error> {
     let vks = virtual_keys(chord)?;
+    // A Chinese IME eats `Control+A` / `Control+V` (the classic "set_value typed
+    // a literal v" bug), so run every synthetic chord with the target's IME out
+    // of the way.
+    let _ime = crate::ime::ImeGuard::install_for(hwnd);
     let mut events = Vec::new();
     for vk in &vks {
         events.push(key(*vk, 0, KEYBD_EVENT_FLAGS(0)));
@@ -685,8 +798,84 @@ mod tests {
         assert_eq!(CLIPBOARD_ALLOC, "GlobalAlloc returned an invalid handle");
         assert_eq!(CLIPBOARD_MISMATCH, "clipboard did not contain requested text after setting it");
         assert_eq!(virtual_keys("Control_L+v").unwrap(), vec![0x11, b'V' as u16]);
+        assert_eq!(virtual_keys("Control_L+a").unwrap(), vec![0x11, b'A' as u16]);
+        assert_eq!(virtual_keys("Delete").unwrap(), vec![0x2E]);
         assert_eq!(virtual_keys("F13").unwrap(), vec![0x7C]);
         assert_eq!(virtual_keys("F20").unwrap(), vec![0x83]);
+    }
+
+    /// The regression this guards: `set_value` on a field that already held a
+    /// value used to fall back to a bare `paste_text`, which *inserts* at the
+    /// caret. The observed result was `15168866515` becoming `15168866515v`
+    /// instead of being replaced. `replace_text` must therefore always emit a
+    /// select-all chord first, and treat the empty string as "clear".
+    #[test]
+    fn replace_text_selects_all_before_writing() {
+        arm_recorder();
+        let _ = replace_text("17653116208");
+        let recorded = take_recorded();
+        // Group the flat event list into chords by walking down/up pairs.
+        let chords = chords_of(&recorded);
+        assert_eq!(
+            chords.first().cloned().unwrap_or_default(),
+            vec![0x11, b'A' as u16],
+            "the first chord must be Ctrl+A (select-all), never a bare paste: {chords:?}"
+        );
+        assert!(
+            chords.iter().any(|c| *c == vec![0x11, b'V' as u16]),
+            "the write itself is a Ctrl+V paste: {chords:?}"
+        );
+        assert_eq!(
+            chords.iter().filter(|c| **c == vec![0x11, b'A' as u16]).count(),
+            1,
+            "exactly one select-all: no double selection, no stray chord: {chords:?}"
+        );
+        // The select-all must come first, not after the paste.
+        let select_all = chords.iter().position(|c| *c == vec![0x11, b'A' as u16]);
+        let paste = chords.iter().position(|c| *c == vec![0x11, b'V' as u16]);
+        assert!(select_all < paste, "order matters: {chords:?}");
+    }
+
+    #[test]
+    fn replace_text_empty_value_clears_the_selection() {
+        arm_recorder();
+        let _ = replace_text("");
+        let recorded = take_recorded();
+        let chords = chords_of(&recorded);
+        assert_eq!(chords.first().cloned().unwrap_or_default(), vec![0x11, b'A' as u16]);
+        assert_eq!(
+            chords.last().cloned().unwrap_or_default(),
+            vec![0x2E],
+            "empty value = select-all then Delete, and no clipboard write: {chords:?}"
+        );
+        assert!(!chords.iter().any(|c| *c == vec![0x11, b'V' as u16]));
+    }
+
+    /// Group a flat down/up event list into chords.
+    ///
+    /// `press_key` emits all keydowns first and then the keyups in reverse
+    /// order, so a chord is simply a run of consecutive keydowns. Anything that
+    /// is not a plain keydown (a keyup, or a `KEYEVENTF_UNICODE` character)
+    /// ends the current run.
+    fn chords_of(recorded: &[RecordedInput]) -> Vec<Vec<u16>> {
+        let mut chords: Vec<Vec<u16>> = Vec::new();
+        for event in recorded {
+            if !event.unicode && !event.key_up {
+                if let Some(last) = chords.last_mut().filter(|c| !c.is_empty()) {
+                    last.push(event.vk);
+                } else {
+                    chords.push(vec![event.vk]);
+                }
+            } else if let Some(last) = chords.last_mut() {
+                // A closing event seals the run so the next keydown starts a
+                // fresh chord.
+                if !last.is_empty() {
+                    chords.push(Vec::new());
+                }
+            }
+        }
+        chords.retain(|c| !c.is_empty());
+        chords
     }
 
     #[test]

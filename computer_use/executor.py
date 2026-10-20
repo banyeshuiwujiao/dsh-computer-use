@@ -16,7 +16,7 @@ ALIASES = {
     "window": "get_window",
 }
 
-HARNESS_TOOLS = ("batch_actions", "session_note", "session_state", "end_turn", "diagnostic_state")
+HARNESS_TOOLS = ("batch_actions", "session_note", "session_state", "end_turn", "diagnostic_state", "fill_form")
 VOID_COMPUTER = frozenset(
     {
         "click",
@@ -59,7 +59,12 @@ class ToolExecutor:
         if canonical == "get_window_state" and name == "observe":
             spec.setdefault("include_screenshot", True)
             spec.setdefault("include_text", False)
-        result = self._dispatch(canonical, spec)
+        # A composite action (fill_form) validates the lease once up front; its
+        # inner steps must not re-validate, otherwise an intervening observation
+        # of a *different* window (the overlay, a popup, a refresh) fails every
+        # remaining step with "last get_window_state was window id X".
+        inner = spec.pop("_lease_ok", False)
+        result = self._dispatch(canonical, spec, lease_ok=inner)
         if canonical in VOID_COMPUTER:
             result = None
         return {"name": name, "canonical": canonical, "result": result, "observation": None}
@@ -71,7 +76,7 @@ class ToolExecutor:
             raise TypeError("arguments must be an object")
         return self.execute(name, arguments)
 
-    def _dispatch(self, name: str, spec: dict[str, object]) -> Any:
+    def _dispatch(self, name: str, spec: dict[str, object], *, lease_ok: bool = False) -> Any:
         if name in BROWSER_TOOLS:
             return self.browser.dispatch(name, spec)
         if name == "get_app_state":
@@ -82,6 +87,8 @@ class ToolExecutor:
             return self.mac.select_text(spec)
         if name == "batch_actions":
             return self._batch(spec)
+        if name == "fill_form":
+            return self._fill_form(spec, lease_ok=lease_ok)
         if name == "session_note":
             self.session.note(str(spec.get("text") or ""))
             return self.session.snapshot()
@@ -166,6 +173,87 @@ class ToolExecutor:
         emit = spec.get("emit_image") is True
         disable_diff = spec.get("disableDiff", spec.get("disableDiffing", True)) is not False
         return self.session.present(raw, emit_image=emit, disable_diff=disable_diff)
+
+    def _fill_form(self, spec: dict[str, Any], *, lease_ok: bool = False) -> dict[str, Any]:
+        """Atomically fill several form fields, then report per-step results.
+
+        Mirrors the Rust helper's `fill_form` (helper-rs/src/main.rs): the
+        default action is a *replace* (`set_value`), never a bare append, and a
+        failing step stops the whole fill unless `continue_on_error` is set.
+        """
+        fields = spec.get("fields") or []
+        if not isinstance(fields, list) or not fields:
+            raise TypeError("fields array must not be empty")
+        # One lease validation for the whole batch. Without it a caller that
+        # never observed the window could drive input blind; the per-step
+        # bypass below only stops *inner* steps from re-validating.
+        #
+        # The Python lease only records observations that came through *this*
+        # executor. When `get_window_state` is served by the native helper
+        # (the normal path) this lease stays empty, so requiring it here would
+        # reject a perfectly valid fill with "no fresh get_window_state". The
+        # helper enforces its own freshness; this side therefore observes once
+        # itself when it has nothing on record, instead of failing closed.
+        if not lease_ok:
+            target = spec.get("window")
+            if isinstance(target, dict) and self.driver.lease.observed_at is None:
+                self.execute("get_window_state", {"window": target, "include_text": True})
+            if isinstance(target, dict):
+                self.driver.lease.require(target, "fill_form")
+        continue_on_error = spec.get("continue_on_error") is True
+        results: list[dict[str, Any]] = []
+        failed = False
+        for i, field in enumerate(fields):
+            if failed and not continue_on_error:
+                break
+            if not isinstance(field, Mapping):
+                results.append({"ok": False, "index": i, "error": "field entry must be an object"})
+                failed = True
+                continue
+            index = field.get("element_index")
+            if index is None:
+                results.append({"ok": False, "index": i, "error": "element_index is required"})
+                failed = True
+                continue
+            value = field.get("value")
+            action = str(field.get("action") or ("set" if value is not None else "click"))
+            base: dict[str, Any] = {"window": field.get("window") or spec.get("window"), "element_index": index}
+            if action in ("set", "value"):
+                if value is None:
+                    results.append({"ok": False, "index": i, "action": action, "element_index": index,
+                                    "error": 'action "set" needs a value'})
+                    failed = True
+                    continue
+                call = {"name": "set_value", "arguments": {**base, "value": str(value)}}
+            elif action == "check":
+                call = {"name": "perform_secondary_action", "arguments": {**base, "action": "Check"}}
+            elif action == "click":
+                call = {"name": "click", "arguments": base}
+            elif action == "press":
+                call = {"name": "press_key",
+                        "arguments": {**base, "key": str(field.get("key") or "Return")}}
+            else:
+                results.append({"ok": False, "index": i, "action": action, "element_index": index,
+                                "error": f"unsupported field action: {action}"})
+                failed = True
+                continue
+            try:
+                outcome = self.execute_call({**call, "arguments": {**call["arguments"], "_lease_ok": True}})
+            except Exception as exc:  # noqa: BLE001 - report, never abort the whole fill silently
+                results.append({"ok": False, "index": i, "action": action, "element_index": index,
+                                "error": str(exc)})
+                failed = True
+                continue
+            results.append({"ok": True, "index": i, "action": action, "element_index": index,
+                            "value": outcome})
+        filled = sum(1 for r in results if r.get("ok"))
+        return {
+            "ok": not failed,
+            "fields": len(results),
+            "filled": filled,
+            "stoppedEarly": failed and not continue_on_error,
+            "results": results,
+        }
 
     def _batch(self, spec: dict[str, object]) -> dict[str, Any]:
         actions = spec.get("actions") or []
