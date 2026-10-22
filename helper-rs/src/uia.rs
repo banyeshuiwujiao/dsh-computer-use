@@ -54,10 +54,10 @@ use windows::Win32::UI::Accessibility::{
     UIA_ValuePatternId, UIA_WindowPatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsChild, IsWindowVisible, PeekMessageW,
-    TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GA_ROOT, MSG, PM_REMOVE,
-    WINEVENT_OUTOFCONTEXT,
+    DispatchMessageW, GetAncestor, GetClientRect, GetForegroundWindow, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsChild, IsWindowVisible,
+    PeekMessageW, TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GA_ROOT, MSG,
+    PM_REMOVE, WINEVENT_OUTOFCONTEXT,
 };
 
 pub const ID_SPACE_EXHAUSTED: &str = "accessibility element ID space exhausted";
@@ -785,6 +785,14 @@ enum Job {
         index: i32,
         resp: Sender<UiaResult<Vec<String>>>,
     },
+    /// An observed element's current readable text (TextPattern), else its
+    /// ValuePattern value; `None` when it publishes neither. The read-back side
+    /// of a write (`value_at`).
+    ValueAt {
+        hwnd: isize,
+        index: i32,
+        resp: Sender<UiaResult<Option<String>>>,
+    },
     /// Resolve a previously observed element index to its UIA runtime id.
     ///
     /// Needed by callers that re-observe between steps (`fill_form`): the walk
@@ -805,6 +813,28 @@ enum Job {
     },
     FocusedValue {
         resp: Sender<UiaResult<Option<String>>>,
+    },
+    /// The focused element's own text, if it exposes any.
+    FocusedText {
+        resp: Sender<UiaResult<Option<String>>>,
+    },
+    /// The focused element's text range (TextPattern) for `window_hwnd`.
+    FocusedTextRange {
+        window_hwnd: isize,
+        resp: Sender<UiaResult<Option<String>>>,
+    },
+    /// Whether the focused element covers (nearly) all of `window_hwnd`.
+    FocusedContainer {
+        window_hwnd: isize,
+        resp: Sender<UiaResult<bool>>,
+    },
+    /// Whether the foreground focused control accepts typed text.
+    FocusedEditability {
+        resp: Sender<UiaResult<Option<bool>>>,
+    },
+    /// The HWND that owns keyboard focus.
+    FocusedWindowId {
+        resp: Sender<UiaResult<Option<isize>>>,
     },
     WindowContains {
         hwnd: isize,
@@ -905,6 +935,110 @@ impl UiaClient {
         self.focused_value().ok().flatten()
     }
 
+    /// The focused element's own text, without walking the whole tree.
+    ///
+    /// The landing check runs on every `type_text`, and a full window dump of an
+    /// Electron/browser window is expensive (hundreds of nodes, a cache rebuild
+    /// each time). The focused element is the one that received the paste, so its
+    /// own `value`/`name` is the cheapest possible witness.
+    /// `None` means the focused element exposes no text at all — the contenteditable
+    /// case, where only the renderer's DOM knows the answer.
+    pub fn focused_text(&self) -> Option<String> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::FocusedText { resp: resp_tx }).ok()?;
+        resp_rx.recv().ok()?.ok().flatten()
+    }
+
+    /// The focused element's text range (TextPattern), if it is a usable witness.
+    ///
+    /// Returns `None` when the focused element covers (nearly) the whole window —
+    /// a browser's `RootWebArea` / a window-level document container. Its range is
+    /// the *entire page*, which would "confirm" any string that merely appears
+    /// somewhere in the UI. That is not a hypothetical: a chat app renders the
+    /// tool call itself (`type_text · <the text>`) into the transcript, so a
+    /// page-wide search for the typed text always succeeds — the 2026-10-22 false
+    /// positive that made a paste into nowhere report success.
+    pub fn focused_text_range_text(&self, window_hwnd: isize) -> Option<String> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::FocusedTextRange {
+                window_hwnd,
+                resp: resp_tx,
+            })
+            .ok()?;
+        resp_rx.recv().ok()?.ok().flatten()
+    }
+
+    /// Whether the focused element is a whole-window container (a page/document
+    /// root). Such an element cannot witness a paste: its text range is the whole
+    /// surface, and it is a container rather than a text target.
+    pub fn focused_is_window_container(&self, window_hwnd: isize) -> Option<bool> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::FocusedContainer {
+                window_hwnd,
+                resp: resp_tx,
+            })
+            .ok()?;
+        resp_rx.recv().ok()?.ok()
+    }
+
+    /// Whether the focused control accepts typed text.
+    ///
+    /// `Some(true)`  -- the focused element is a text surface (an Edit/Document
+    ///                 control type, or it exposes a writable ValuePattern). A paste
+    ///                 sent there had somewhere to land.
+    /// `Some(false)` -- there is a focused element and it provably cannot take
+    ///                 text (a button, a list).
+    /// `None`        -- no focused element, or the monitor could not answer.
+    ///
+    /// This exists because some text surfaces never publish their content to UIA
+    /// (Chromium `contenteditable`, ProseMirror, canvas editors), so "the text is
+    /// not readable" is *not* evidence that a paste failed. Callers use this to
+    /// tell "absent" from "unverifiable" instead of reporting a false failure.
+    pub fn focused_is_editable(&self) -> Option<bool> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::FocusedEditability { resp: resp_tx }).ok()?;
+        resp_rx.recv().ok()?.ok().flatten()
+    }
+
+    /// The window id (HWND) that currently owns keyboard focus, if it can be read.
+    pub fn focused_window_id(&self) -> Option<isize> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::FocusedWindowId { resp: resp_tx }).ok()?;
+        resp_rx.recv().ok()?.ok().flatten()
+    }
+
+    /// One dump answering both landing questions: does any node contain `needle`,
+    /// and does the window publish any readable text at all.
+    ///
+    /// This is the *fallback* path: it walks the whole tree, which is expensive for
+    /// a browser window. The landing check only reaches it when the focused element
+    /// could not answer on its own.
+    /// `None` means the dump could not be taken.
+    pub fn window_landing_probe(&self, hwnd: isize, needle: &str) -> Option<(bool, bool)> {
+        let dump = self.dump(hwnd, "", (0.0, 0.0), 1.0).ok()?;
+        let mut contains = false;
+        let mut publishes = false;
+        for node in &dump.nodes {
+            if !contains && (node.value.contains(needle) || node.name.contains(needle)) {
+                contains = true;
+            }
+            if !publishes && (!node.value.trim().is_empty() || !node.name.trim().is_empty()) {
+                publishes = true;
+            }
+            if contains && publishes {
+                break;
+            }
+        }
+        Some((contains, publishes))
+    }
+
     /// Target-scoped landing check: dump the target window and report whether
     /// `needle` appears in any node's value or name. Works even when the window is
     /// not foreground, so it can confirm a paste landed (or detect it did not)
@@ -979,6 +1113,21 @@ impl UiaClient {
             .send(Job::CachedActions { index, resp: resp_tx })
             .map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?;
         resp_rx.recv().map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?
+    }
+
+    /// What an observed element currently shows, for a read-back after a write:
+    /// its rendered text when it has a TextPattern, else its ValuePattern value.
+    /// `None` when it publishes neither (an unverifiable control), so callers can
+    /// tell "cannot verify" from "did not take".
+    ///
+    /// Used by `fill_form`'s `set` step: a `set` that reports success while the
+    /// field kept its old text is the 2026-10-22 React false success (the TapTap
+    /// login form got the verification code written into the phone box, both
+    /// steps `ok`). Verifying each write turns that into a named failed step.
+    pub fn value_at(&self, hwnd: isize, index: i32) -> Option<String> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::ValueAt { hwnd, index, resp: resp_tx }).ok()?;
+        resp_rx.recv().ok()?.ok()?
     }
 
     /// The UIA runtime id of a node observed by the latest walk.
@@ -1258,6 +1407,15 @@ fn monitor_loop(rx: Receiver<Job>) {
                     .ok_or_else(|| format!("element {index} {NO_CACHED_SECONDARY}"));
                 let _ = resp.send(result);
             }
+            Job::ValueAt { hwnd, index, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => unsafe { eng.value_at(hwnd, index) },
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
             Job::RuntimeId { index, resp } => {
                 let result = engine
                     .as_ref()
@@ -1289,6 +1447,66 @@ fn monitor_loop(rx: Receiver<Job>) {
                     Some(eng) => {
                         eng.apply_invalidate();
                         Ok(unsafe { eng.focused_value() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedText { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_text() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedTextRange { window_hwnd, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_text_range_text(window_hwnd) })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedContainer { window_hwnd, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_is_window_container(window_hwnd) })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedEditability { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_is_editable() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedWindowId { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_window_id() })
                     }
                     None => Err(setup_err
                         .clone()
@@ -1345,6 +1563,9 @@ fn fail_job(job: Job, err: &str) {
         Job::CachedActions { resp, index } => {
             let _ = resp.send(Err(format!("element {index} {NO_CACHED_SECONDARY}")));
         }
+        Job::ValueAt { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
         Job::RuntimeId { resp, index } => {
             let _ = resp.send(Err(format!("element {index} {RUNTIME_ID_MISMATCH}")));
         }
@@ -1357,6 +1578,21 @@ fn fail_job(job: Job, err: &str) {
             let _ = resp.send(payload);
         }
         Job::FocusedValue { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedText { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedTextRange { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedContainer { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedEditability { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedWindowId { resp } => {
             let _ = resp.send(Err(err.to_string()));
         }
         Job::WindowContains { resp, .. } => {
@@ -1868,6 +2104,148 @@ impl Engine {
         Some(value_of(&el))
     }
 
+    /// The focused element's own text, without walking the window tree.
+    ///
+    /// `None` when the element exposes no text at all (a Chromium `contenteditable`
+    /// publishes its content only in the renderer's DOM, not in UIA).
+    unsafe fn focused_text(&mut self) -> Option<String> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        // Value first (edit boxes), then Name (a button's label, a Document's title).
+        let value = value_of(&el);
+        if !value.is_empty() {
+            return Some(value);
+        }
+        let name = el
+            .CachedName()
+            .ok()
+            .or_else(|| el.CurrentName().ok())
+            .map(bstr_to_string)
+            .unwrap_or_default();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// The focused element's text range (TextPattern), if it is a usable witness.
+    ///
+    /// `None` when the element covers (nearly) the whole window: a browser's
+    /// `RootWebArea` or another window-level document container. Its range is the
+    /// entire page, so it would "confirm" any string that merely appears somewhere
+    /// in the UI — including the agent's own tool-call echo in a chat transcript.
+    unsafe fn focused_text_range_text(&mut self, window_hwnd: isize) -> Option<String> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        if is_window_container(&el, window_hwnd) {
+            return None;
+        }
+        let pat = pattern::<IUIAutomationTextPattern>(&el, UIA_TextPatternId)?;
+        let range = pat.DocumentRange().ok()?;
+        let text = range.GetText(-1).ok()?;
+        let value = bstr_to_string(text);
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Whether the focused element covers (nearly) all of `window_hwnd`.
+    unsafe fn focused_is_window_container(&mut self, window_hwnd: isize) -> bool {
+        match self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())
+        {
+            Some(el) => is_window_container(&el, window_hwnd),
+            None => false,
+        }
+    }
+
+    /// Whether the focused control accepts typed text. See
+    /// [`UiaClient::focused_is_editable`] for the three-state contract.    ///
+    /// The judgement is deliberately pattern/type based rather than
+    /// class-name based, so it covers native edits, WinUI boxes, and browser
+    /// text surfaces without a per-app allow list:
+    ///   * a writable ValuePattern  -> editable (a plain edit box);
+    ///   * an Edit control type      -> editable (password fields and providers
+    ///                                  that omit ValuePattern);
+    ///   * a Document control type   -> editable unless its TextPattern reports
+    ///                                  read-only (Chromium `contenteditable`,
+    ///                                  Word, ProseMirror all surface as Document);
+    ///   * anything else             -> not editable.
+    unsafe fn focused_is_editable(&mut self) -> Option<bool> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        // A writable value pattern is the strongest positive signal.
+        if let Some(pat) = pattern::<IUIAutomationValuePattern>(&el, UIA_ValuePatternId) {
+            let readonly = pat
+                .CachedIsReadOnly()
+                .ok()
+                .or_else(|| pat.CurrentIsReadOnly().ok())
+                .map(|b| b.as_bool())
+                .unwrap_or(false);
+            if !readonly {
+                return Some(true);
+            }
+        }
+        let ctype = control_type_id(&el);
+        // UIA_EditControlTypeId = 50004.
+        if ctype == 50004 {
+            return Some(true);
+        }
+        if ctype == UIA_DOCUMENT_CONTROL_TYPE {
+            // A Document is the text surface of a browser or an editor
+            // (Chromium `contenteditable`, ProseMirror, Word all surface this way).
+            // `IUIAutomationTextRange` exposes no IsReadOnly, and the read-only
+            // Document case is a viewer whose paste simply does not change the
+            // text — the landing check stays honest because the *dump* then still
+            // publishes text, so a genuine miss is still reported as Absent.
+            // Treating the surface as text-accepting here is what keeps a
+            // contenteditable paste from being reported as a failure.
+            return Some(true);
+        }
+        Some(false)
+    }
+
+    /// The HWND that owns keyboard focus. Read from the focused element's native
+    /// window handle, walking to its top-level ancestor so a focused child control
+    /// reports the window a paste was addressed to.
+    unsafe fn focused_window_id(&mut self) -> Option<isize> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        let hwnd = el
+            .CachedNativeWindowHandle()
+            .ok()
+            .or_else(|| el.CurrentNativeWindowHandle().ok())
+            .map(|h| h.0 as isize)?;
+        if hwnd == 0 {
+            return None;
+        }
+        let handle = HWND(hwnd as *mut core::ffi::c_void);
+        let root = GetAncestor(handle, GA_ROOT);
+        if root.is_invalid() {
+            Some(hwnd)
+        } else {
+            Some(root.0 as isize)
+        }
+    }
+
     unsafe fn set_value(&mut self, hwnd: isize, index: i32, value: &str) -> UiaResult<()> {
         let el = self.cached_element(hwnd, index)?;
         el.SetFocus().map_err(|_| FOCUS_BEFORE_SET_VALUE.to_string())?;
@@ -1911,6 +2289,28 @@ impl Engine {
                 // requested value differs from what was already there.
                 let _ = crate::input::replace_text_for(Some(hwnd), value);
             }
+            // Second, independent witness: a *rendered text* read. A controlled
+            // input (React/Vue) or an IME can accept the write into the UIA value
+            // echo and still show the old text or a stray fragment on screen — the
+            // 2026-10-23 case where `Value: v` was reported as success. When the
+            // element publishes its text through TextPattern and that text does not
+            // carry the requested value, one replace pass is tried, then the write
+            // is reported as failed rather than silently wrong.
+            if let Some(rendered) = text_pattern_of(&el) {
+                let rendered = rendered.replace('\r', "");
+                if !rendered.contains(value) {
+                    let _ = crate::input::replace_text_for(Some(hwnd), value);
+                    if let Some(again) = text_pattern_of(&el) {
+                        let again = again.replace('\r', "");
+                        if !again.contains(value) {
+                            return Err(format!(
+                                "set_value did not take: the field's text reads {:?}, not the value given",
+                                clip_text(&again, 40)
+                            ));
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
         if let Some(rng) = pattern::<IUIAutomationRangeValuePattern>(&el, UIA_RangeValuePatternId) {
@@ -1922,6 +2322,26 @@ impl Engine {
             return Ok(());
         }
         Err(NOT_SETTABLE.to_string())
+    }
+
+    /// What an element shows now: its rendered text (TextPattern) when it has
+    /// one, else its ValuePattern value. `None` when it publishes neither.
+    ///
+    /// The read-back side of `fill_form`'s `set` step (see `value_at` on the
+    /// handle). Never dumps the tree: it is one pattern read on a cached element.
+    unsafe fn value_at(&mut self, hwnd: isize, index: i32) -> UiaResult<Option<String>> {
+        // Resolve through cached_element (the same path set_value uses): it
+        // rebuilds the element from the walk's cache and validates its runtime
+        // id, so the read-back sees the control the write targeted even after a
+        // focus event invalidated the bare map.
+        let el = self.cached_element(hwnd, index)?;
+        if let Some(text) = text_pattern_of(&el) {
+            return Ok(Some(text));
+        }
+        let v = pattern::<IUIAutomationValuePattern>(&el, UIA_ValuePatternId)
+            .and_then(|pat| pat.CurrentValue().ok())
+            .map(bstr_to_string);
+        Ok(v)
     }
 
     unsafe fn select_text(&mut self, hwnd: isize, index: i32, text: &str) -> UiaResult<()> {
@@ -2215,6 +2635,42 @@ fn control_type_id(el: &IUIAutomationElement) -> i32 {
     }
 }
 
+/// How much of the window an element must cover to count as a window container.
+///
+/// A page/document root covers the whole client area; a real text field covers a
+/// small share of it. 70% separates them with a wide margin either way, and the
+/// rule needs no per-app or per-framework knowledge — which is what keeps it
+/// general across browser `RootWebArea`, Word's document pane, and native
+/// window-level rich edits.
+const WINDOW_CONTAINER_COVERAGE: f64 = 0.7;
+
+/// Whether `el` covers (nearly) all of `window_hwnd`'s client area.
+///
+/// Such an element is a container, not a text target: its TextPattern range spans
+/// the entire surface, so using it to look for typed text "confirms" anything that
+/// merely appears on screen (an agent's own tool-call echo in a chat transcript,
+/// for instance). Container focus therefore cannot witness a paste either way.
+fn is_window_container(el: &IUIAutomationElement, window_hwnd: isize) -> bool {
+    unsafe {
+        let handle = HWND(window_hwnd as *mut core::ffi::c_void);
+        if handle.is_invalid() {
+            return false;
+        }
+        let mut client = RECT::default();
+        if GetClientRect(handle, &mut client).is_err() {
+            return false;
+        }
+        let window_area =
+            (client.right - client.left) as f64 * (client.bottom - client.top) as f64;
+        if window_area <= 0.0 {
+            return false;
+        }
+        let rect = element_rect(el);
+        let element_area = (rect.right - rect.left) as f64 * (rect.bottom - rect.top) as f64;
+        element_area / window_area >= WINDOW_CONTAINER_COVERAGE
+    }
+}
+
 fn element_rect(el: &IUIAutomationElement) -> RECT {
     unsafe {
         el.CachedBoundingRectangle()
@@ -2239,6 +2695,31 @@ fn value_of(el: &IUIAutomationElement) -> String {
         .map(bstr_to_string)
         .unwrap_or_default()
 }
+
+/// A value cut to `max` characters for an error message, with an ellipsis, so a
+/// page's whole text never lands in a tool error.
+fn clip_text(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(max).collect::<String>())
+}
+
+/// The element's own text as TextPattern reports it, when it has one.
+///
+/// A second, independent witness beside `ValuePattern`: a controlled input can
+/// echo a `SetValue` into its UIA value model while its rendered text keeps the
+/// old content (the React false-success of 2026-10-22). TextPattern reads the
+/// rendered text, so disagreeing with it is the one in-process signal that the
+/// write did not take. `None` when the element exposes no text pattern or its
+/// range is unbounded (a whole-window container, whose range is the page).
+fn text_pattern_of(el: &IUIAutomationElement) -> Option<String> {
+    let pat = text_pattern(el)?;
+    let range = unsafe { pat.DocumentRange().ok()? };
+    unsafe { range.GetText(-1).ok() }.map(bstr_to_string)
+}
+
 
 fn expand_state(el: &IUIAutomationElement) -> Option<ExpandCollapseState> {
     pattern::<IUIAutomationExpandCollapsePattern>(el, UIA_ExpandCollapsePatternId).and_then(|pat| unsafe {

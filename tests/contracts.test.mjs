@@ -902,3 +902,88 @@ test('P1-6 admitImages harvests top-level images and calls attachments service c
 })
 
 
+// ---------------------------------------------------------------------------
+// `text` is a payload on most tools and an element selector on three of them.
+// The selector pass used to run for every tool and then delete `input.text`, so
+// `type_text({window, text})` reached the helper as `{window}` and failed with
+// "text is required" (helper-rs protocol.rs require_text_allow_empty). These two
+// tests pin both halves of the split.
+
+test('C-TEXT-1 type_text forwards its text payload instead of consuming it as a selector', async () => {
+  const harness = makeHarness()
+  await applyTools(harness.ctx, ToolConfig({}))
+  const tool = harness.registered.get('type_text')
+  assert.ok(tool, 'type_text must be registered on the computer surface')
+
+  await tool.execute(
+    { window: { app: 'notepad.exe', id: 1 }, text: 'hello world' },
+    { agent: { id: 's' }, arguments: {} },
+  )
+
+  const call = harness.calls.find(entry => entry.name === 'type_text')
+  assert.ok(call, 'the helper must be called')
+  assert.equal(call.args.text, 'hello world', 'the payload must survive the selector pass')
+  assert.equal(call.args.element_index, undefined, 'type_text must not gain an element_index')
+})
+
+test('C-TEXT-2 click still consumes text as an element selector', async () => {
+  const harness = makeHarness()
+  await applyTools(harness.ctx, ToolConfig({}))
+  const tool = harness.registered.get('click')
+  assert.ok(tool, 'click must be registered')
+
+  await tool.execute(
+    { window: { app: 'notepad.exe', id: 1 }, text: 'Save', x: 10, y: 10 },
+    { agent: { id: 's' }, arguments: {} },
+  )
+
+  const call = harness.calls.find(entry => entry.name === 'click')
+  assert.ok(call, 'the helper must be called')
+  assert.equal(call.args.text, undefined, 'text is a selector for click, never a payload')
+  assert.equal(call.args.x, 10, 'coordinates still reach the helper')
+})
+
+// tools-improved #18: a `text` that names no element must fail with a message
+// that says so, not fall through to `click requires x`. (No observation in this
+// harness, so the message points at get_window_state — the same code path that
+// would otherwise yield the misleading coordinate error.)
+test('C-TEXT-4 click text with no match names the miss', async () => {
+  const harness = makeHarness()
+  await applyTools(harness.ctx, ToolConfig({}))
+  const tool = harness.registered.get('click')
+  assert.ok(tool, 'click must be registered')
+
+  let threw = null
+  try {
+    await tool.execute(
+      { window: { app: 'magpie.exe', id: 2 }, text: 'Definitely Not Present' },
+      { agent: { id: 's' }, arguments: {} },
+    )
+  } catch (e) {
+    threw = e
+  }
+  assert.ok(threw, 'an unmatched text must throw, not call the helper without a target')
+  assert.match(String(threw.message), /found no element matching text "Definitely Not Present"/)
+  assert.equal(harness.calls.find(entry => entry.name === 'click'), undefined, 'the helper is not called')
+})
+
+test('C-TEXT-3 session_note keeps its text payload', async () => {
+  const harness = makeHarness({
+    desktopTools: DESKTOP_13.concat([{
+      name: 'session_note',
+      description: 'note',
+      parameters: { type: 'object', properties: { text: { type: 'string' } } },
+    }]),
+  })
+  await applyTools(harness.ctx, ToolConfig({}))
+  const tool = harness.registered.get('session_note')
+  assert.ok(tool, 'session_note must be registered when the catalog offers it')
+
+  await tool.execute({ text: 'remember this' }, { agent: { id: 's' }, arguments: {} })
+
+  const call = harness.calls.find(entry => entry.name === 'session_note')
+  assert.ok(call, 'the helper must be called')
+  assert.equal(call.args.text, 'remember this', 'a note is a payload, not a selector')
+})
+
+

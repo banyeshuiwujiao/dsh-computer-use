@@ -523,6 +523,13 @@ function experienceTool(state) {
 }
 
 
+//: Tools that accept `text` as "the element named X" rather than as a payload.
+//: Mirrors exactly the tools whose schema gets the optional `text` property in
+//: {@link makeSidecarTool}. Every other tool must keep `text` intact:
+//: `type_text` types it, `session_note` stores it.
+const TEXT_SELECTOR_TOOLS = new Set(['click', 'set_value', 'perform_secondary_action'])
+
+
 function makeSidecarTool(ctx, spec, config, state, options) {
   const parameters = spec.parameters && typeof spec.parameters === 'object'
     ? JSON.parse(JSON.stringify(spec.parameters))
@@ -566,17 +573,49 @@ function makeSidecarTool(ctx, spec, config, state, options) {
     },
     async execute(args, exec) {
       const input = args && typeof args === 'object' ? { ...args } : {}
-      const targetText = typeof input.text === 'string' ? input.text.trim() : ''
-      if (targetText && input.element_index === undefined && (input.x === undefined || input.y === undefined)) {
-        if (state.lastElements && state.lastElements.length > 0) {
-          const matched = state.lastElements.find(e => e.name && e.name.toLowerCase().includes(targetText.toLowerCase()))
-            || state.lastElements.find(e => e.raw && e.raw.toLowerCase().includes(targetText.toLowerCase()))
-          if (matched) {
-            input.element_index = matched.index
+      // "text as element name" is a convenience of three tools only; for every
+      // other tool `text` is the payload. This block used to run unconditionally
+      // and then `delete input.text`, so `type_text({window, text})` reached the
+      // helper as `{window}` and failed with "text is required" — the payload
+      // never survived the selector pass. `session_note` lost its note the same
+      // way. Guarding on the tool keeps both intact.
+      if (TEXT_SELECTOR_TOOLS.has(spec.name)) {
+        const targetText = typeof input.text === 'string' ? input.text.trim() : ''
+        if (targetText && input.element_index === undefined && (input.x === undefined || input.y === undefined)) {
+          if (state.lastElements && state.lastElements.length > 0) {
+            const matched = state.lastElements.find(e => e.name && e.name.toLowerCase().includes(targetText.toLowerCase()))
+              || state.lastElements.find(e => e.raw && e.raw.toLowerCase().includes(targetText.toLowerCase()))
+            if (matched) {
+              input.element_index = matched.index
+            }
+          }
+          // The text named no element: say so, with the nearest candidates,
+          // instead of letting the helper answer `click requires x` (which reads
+          // as "you forgot the coordinates" and sends the model chasing the wrong
+          // thing — 2026-10-22/23). Only reachable with no index and no x/y.
+          if (input.element_index === undefined) {
+            const hay = targetText.toLowerCase()
+            const near = (state.lastElements || [])
+              .filter(e => typeof e.name === 'string' && e.name)
+              .map(e => e.name)
+              .filter(name => {
+                const n = name.toLowerCase()
+                // cheap similarity: share a substring of 3+ chars either way
+                return n.includes(hay.slice(0, 3)) || hay.includes(n.slice(0, 3))
+              })
+              .slice(0, 5)
+            const hint = near.length
+              ? ` Closest: ${near.join(' | ')}`
+              : (state.lastElements && state.lastElements.length
+                  ? ' Call get_window_state again and pass element_index.'
+                  : ' No observation yet: call get_window_state first.')
+            throw new Error(
+              `${spec.name} found no element matching text "${targetText}" in the current observation.${hint}`,
+            )
           }
         }
+        delete input.text
       }
-      delete input.text
 
       const required = REQUIRED_DOCS[spec.name]
       if (required) {

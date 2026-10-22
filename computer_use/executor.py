@@ -259,7 +259,33 @@ class ToolExecutor:
         actions = spec.get("actions") or []
         if not isinstance(actions, list):
             raise TypeError("actions must be an array")
-        results = [self.execute_call(item) for item in actions if isinstance(item, Mapping)]
+        results: list[dict[str, Any]] = []
+        for index, item in enumerate(actions):
+            # Mirror the Rust helper's `batch_action_name` exactly: only a *string*
+            # name counts, so `{"name": 7}` is rejected rather than stringified to
+            # "7" and dispatched. Before both guards an entry with no usable name
+            # either vanished (non-mapping) or reached dispatch as "", whose
+            # diagnostic is the bare `unsupported method: ` prefix.
+            name = item.get("name") if isinstance(item, Mapping) else None
+            if not isinstance(name, str) or not name.strip():
+                results.append(
+                    {
+                        "ok": False,
+                        "index": index,
+                        "error": 'each action needs a non-empty string "name" and an "arguments" object, '
+                        'e.g. {"name":"press_key","arguments":{"window":{...},"key":"Return"}}; '
+                        'an item written as {"action":...} names no method to run',
+                    }
+                )
+                continue
+            try:
+                results.append(self.execute_call(item))
+            except Exception as error:  # noqa: BLE001 - mirror the Rust per-item error
+                # Rust turns a dispatch failure into a per-item entry; a Python
+                # raise would otherwise abort the whole batch on one bad action.
+                results.append(
+                    {"ok": False, "index": index, "name": name, "error": str(error)}
+                )
         then = str(spec.get("then") or "")
         refresh = None
         if then == "tab_ax_write":
