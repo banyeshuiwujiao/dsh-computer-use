@@ -519,6 +519,16 @@ impl HelperState {
                     "the observation lease was cleared at the start of this turn; call get_window_state once before using this window",
                 ));
             }
+            // A coordinate action with no cached capture session has a specific,
+            // fixable cause: the last observation returned no screenshot (a
+            // text-only observation, or a helper that had just restarted). Saying
+            // "target is unavailable" alone sent the model hunting for the wrong
+            // thing (tools-improved #28b).
+            if use_ == WindowUse::Coordinate && crate::capture::cached_session_count() == 0 {
+                return Err(Error::desktop(
+                    "coordinate input needs a screenshot from the last observation, and none is cached; call get_window_state with include_screenshot:true (or use element_index) before clicking by x/y",
+                ));
+            }
             return Err(Error::desktop(identity_error(use_, IdentityFail::Missing)));
         };
         if identity.root_hwnd != 0 && identity.root_hwnd != id {
@@ -711,8 +721,16 @@ mod tests {
         let st = HelperState::new("window2".into());
         let err = st.require_window(1).unwrap_err();
         assert_eq!(err.message, CALL_GET_WINDOW_STATE);
+        // A coordinate action with no observation: with no cached capture session
+        // the message now names the real cause (need a screenshot first); otherwise
+        // it is the official "target is unavailable".
         let err = st.require_coordinate_target(1).unwrap_err();
-        assert_eq!(err.message, COORD_TARGET_UNAVAILABLE);
+        assert!(
+            err.message == COORD_TARGET_UNAVAILABLE
+                || err.message.contains("needs a screenshot from the last observation"),
+            "unexpected: {}",
+            err.message
+        );
         let err = st.require_window(0).unwrap_err();
         assert_eq!(err.message, WINDOW_ID_REQUIRED);
     }

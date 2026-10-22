@@ -573,6 +573,19 @@ function makeSidecarTool(ctx, spec, config, state, options) {
     },
     async execute(args, exec) {
       const input = args && typeof args === 'object' ? { ...args } : {}
+      // set_value takes the value in `value`; `text` is only the element selector.
+      // Writing the value into `text` reaches the helper as a missing `value` and
+      // fails with "value is required", which reads like a schema error rather
+      // than "put it in the other field" (tools-improved #23). Checked before the
+      // selector pass so the answer names the real mistake, not "no match".
+      if (spec.name === 'set_value' && input.value === undefined
+          && typeof input.text === 'string' && input.text.trim()
+          && input.element_index === undefined) {
+        throw new Error(
+          `set_value needs its value in "value", not "text" ("${input.text.trim()}" was read as an element name). `
+          + 'Pass value:"…" with element_index, or use type_text.',
+        )
+      }
       // "text as element name" is a convenience of three tools only; for every
       // other tool `text` is the payload. This block used to run unconditionally
       // and then `delete input.text`, so `type_text({window, text})` reached the

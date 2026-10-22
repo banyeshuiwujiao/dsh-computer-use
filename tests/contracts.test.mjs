@@ -943,10 +943,28 @@ test('C-TEXT-2 click still consumes text as an element selector', async () => {
   assert.equal(call.args.x, 10, 'coordinates still reach the helper')
 })
 
-// tools-improved #18: a `text` that names no element must fail with a message
-// that says so, not fall through to `click requires x`. (No observation in this
-// harness, so the message points at get_window_state — the same code path that
-// would otherwise yield the misleading coordinate error.)
+// tools-improved #23: set_value with the value in `text` (and no value/index)
+// must say where it belongs, not fail with a bare "value is required".
+test('C-TEXT-5 set_value points a misplaced value at value', async () => {
+  const harness = makeHarness()
+  await applyTools(harness.ctx, ToolConfig({}))
+  const tool = harness.registered.get('set_value')
+  assert.ok(tool, 'set_value must be registered')
+
+  let threw = null
+  try {
+    await tool.execute(
+      { window: { app: 'magpie.exe', id: 2 }, text: 'kilo' },
+      { agent: { id: 's' }, arguments: {} },
+    )
+  } catch (e) {
+    threw = e
+  }
+  assert.ok(threw, 'a value in text with no value must throw')
+  assert.match(String(threw.message), /needs its value in "value", not "text"/)
+  assert.equal(harness.calls.find(entry => entry.name === 'set_value'), undefined)
+})
+
 test('C-TEXT-4 click text with no match names the miss', async () => {
   const harness = makeHarness()
   await applyTools(harness.ctx, ToolConfig({}))
