@@ -519,7 +519,7 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                     "helperRid": uia::integrity_rid(std::process::id()),
                     "helperLabel": uia::integrity_label(uia::integrity_rid(std::process::id())),
                 },
-                "capture": {"wgcFramePool": capture::wgc_available(), "jpeg": true, "cachedSessionCount": capture::cached_session_count()},
+                "capture": {"wgcFramePool": capture::wgc_available(), "jpeg": true, "cachedSessionCount": capture::cached_session_count(), "coverage": capture::capture_diagnostics()},
                 "dpi": {"aware": true, "scale": dpi::dpi_scale(dpi::window_dpi(hwnd_from_id(0)))},
             }))
         }
@@ -533,6 +533,16 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                     .unwrap_or_else(|| "computer".into())
             });
             Ok(tools::tools_for_surface(&surface))
+        }
+        // Diagnostic probe: report exactly what the occlusion check sees for a
+        // window, so a "captured the wrong window" report can be rooted instead of
+        // reasoned about from the outside.
+        "probe_coverage" => {
+            let hwnd = json_i64(params, "hwnd")?
+                .map(|v| v as isize)
+                .or_else(|| state.lock().ok().and_then(|st| st.last_window.as_ref().map(|w| w.id as isize)))
+                .ok_or_else(|| Error::type_err("hwnd is required"))?;
+            Ok(capture::coverage_probe(hwnd))
         }
         "prompt" => Ok(json!({"prompt": prompt::native_prompt()})),
         // BR-14: the official host hook `assertBrowserUrlAllowed`. Pure decision, no
@@ -1201,6 +1211,33 @@ fn fill_form(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<
     // "last get_window_state was window id X" even though the caller did observe
     // the form. Running the real observation here is what makes `fill_form`
     // self-sufficient — and it is the same node table the steps then index into.
+    //
+    // BUT: every walk renumbers the nodes from zero, and this refresh happens
+    // *after* the caller read its indices off its own snapshot. Writing a value
+    // makes a live page insert or remove siblings (a resend countdown, a clear
+    // button, an error line), so the numbering shifts and the index that named
+    // the verification-code box in the caller's snapshot can name the
+    // phone-number box in ours. Observed live on the TapTap desktop login form
+    // (2026-10-20): a two-step `fill_form` wrote the verification code into the
+    // phone field, and both steps still reported `ok`.
+    //
+    // So carry the caller's indices across the refresh as runtime ids: read each
+    // step's runtime id from the cache as it stands (the caller's snapshot, when
+    // it is still the live one), walk, then map the id back to the fresh index.
+    // A control that left the tree is reported as a failed step rather than
+    // silently retargeted — acting on the wrong control is worse than acting on
+    // none.
+    let mut carried: Vec<Option<Vec<i32>>> = Vec::with_capacity(steps.len());
+    for step in steps.iter() {
+        let runtime_id = step
+            .as_object()
+            .and_then(|s| s.get("element_index"))
+            .and_then(Value::as_i64)
+            .and_then(|i| uia::global().runtime_id(i as i32).ok())
+            .filter(|id| !id.is_empty());
+        carried.push(runtime_id);
+    }
+
     let refresh = json!({
         "window": window.to_json(),
         "include_screenshot": false,
@@ -1226,6 +1263,33 @@ fn fill_form(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<
             results.push(json!({"ok": false, "index": i, "error": "element_index is required"}));
             failed = true;
             continue;
+        };
+        // Re-resolve the caller's index against the post-refresh numbering.
+        let index = match carried.get(i).and_then(Option::as_ref) {
+            Some(runtime_id) => match uia::global().index_of(runtime_id) {
+                Ok(Some(fresh)) => fresh as i64,
+                Ok(None) => {
+                    results.push(json!({
+                        "ok": false, "index": i, "element_index": index,
+                        "error": format!(
+                            "element {index} left the tree while filling (the page re-rendered it); re-observe and retry"
+                        ),
+                    }));
+                    failed = true;
+                    continue;
+                }
+                Err(e) => {
+                    results.push(json!({
+                        "ok": false, "index": i, "element_index": index, "error": e,
+                    }));
+                    failed = true;
+                    continue;
+                }
+            },
+            // No runtime id to carry (the caller's snapshot was already gone):
+            // fall back to the raw index, which at least matches a fresh
+            // observation taken immediately before the call.
+            None => index,
         };
         let value = step.get("value").and_then(Value::as_str);
         let kind = step
@@ -1795,6 +1859,48 @@ mod tests {
         assert_eq!(request["app"], AUDIO_APP);
         assert_eq!(request["displayName"], protocol::AUDIO_DISPLAY);
         assert_eq!(request["allowPersistentApproval"], false);
+    }
+
+    /// Regression for the 2026-10-20 TapTap login run.
+    ///
+    /// `fill_form` re-observes before running its steps, and that walk renumbers
+    /// every node from zero. A page that inserts a sibling after the first write
+    /// (the resend countdown the login form grows, a clear button, an error line)
+    /// shifts the numbering, so the caller's index for the *second* field then
+    /// names whatever slid into that slot. On TapTap that wrote the SMS code into
+    /// the phone-number box while both steps reported `ok`.
+    ///
+    /// The contract this pins down: an index is only meaningful inside one
+    /// snapshot; a runtime id is the handle that survives renumbering.
+    #[test]
+    fn renumbering_between_steps_must_be_resolved_by_runtime_id_not_index() {
+        // Snapshot A: what the model saw, indices off the caller's observation.
+        let before: Vec<(i32, Vec<i32>)> = vec![(19, vec![42, 91]), (20, vec![42, 92])];
+        // Snapshot B: the page inserted a node ("重新发送 57s") *between* the two
+        // fields, so every node below it shifted down by one. Index 20 now names
+        // the countdown instead of the verification-code box.
+        let after: Vec<(i32, Vec<i32>)> = vec![(19, vec![42, 91]), (20, vec![42, 2088]), (21, vec![42, 92])];
+
+        let index_of = |runtime_id: &Vec<i32>| -> Option<i32> {
+            after.iter().find(|(_, id)| id == runtime_id).map(|(i, _)| *i)
+        };
+        let runtime_id_at = |index: i32| -> Option<Vec<i32>> {
+            after.iter().find(|(i, _)| *i == index).map(|(_, id)| id.clone())
+        };
+
+        // The flattened index the caller passed for the code field no longer
+        // names the code field.
+        let caller_index_for_code = 20;
+        assert_eq!(runtime_id_at(caller_index_for_code), Some(vec![42, 2088]));
+        assert_ne!(runtime_id_at(caller_index_for_code), Some(before[1].1.clone()));
+
+        // Carrying the runtime id finds it again.
+        let caller_runtime_id_for_code = before[1].1.clone();
+        assert_eq!(index_of(&caller_runtime_id_for_code), Some(21));
+
+        // And a control the page dropped is reported as gone, never retargeted.
+        let vanished = vec![42, 999];
+        assert_eq!(index_of(&vanished), None);
     }
 }
 

@@ -124,10 +124,19 @@ class HelperFillFormProtocolTests(unittest.TestCase):
         # never silently accepted.
         self.assertFalse(reply.get("ok", True), f"empty fields must not be a no-op: {reply}")
         text = json.dumps(reply)
-        self.assertTrue(
-            "fields array" in text or "window" in text.lower(),
-            f"a descriptive error is required: {text}",
+        # The refusal may come from either gate, and the two of them word it
+        # differently: the empty-fields check says "fields array", the window
+        # gate raises an approvalRequest that names the app and says approval
+        # is required. Assert on "a reason is given", not on one gate's exact
+        # wording — the gate that fires first is an ordering detail, not a
+        # contract. What must never happen is a silent ok:true.
+        refused_with_reason = (
+            "fields array" in text
+            or "window" in text.lower()
+            or "approval" in text.lower()
+            or "approvalRequest" in text
         )
+        self.assertTrue(refused_with_reason, f"a descriptive error is required: {text}")
 
     def test_unknown_field_action_is_reported(self) -> None:
         reply = self.helper.call(

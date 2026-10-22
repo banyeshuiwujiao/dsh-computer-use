@@ -45,7 +45,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetTopWindow, GetWindow, GetWindowLongW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, PeekMessageW, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SwitchToThisWindow, SystemParametersInfoW, GA_ROOT, GW_ENABLEDPOPUP, GW_HWNDNEXT, GW_OWNER,
+    SwitchToThisWindow, SystemParametersInfoW, WindowFromPoint, GA_ROOT, GW_ENABLEDPOPUP, GW_HWNDNEXT,
+    GW_OWNER,
     GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_NOREMOVE, SM_CXSCREEN,
     SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
@@ -950,6 +951,80 @@ pub fn uses_redirected_composition(hwnd: HWND) -> bool {
 
 pub fn is_window_visible(hwnd: HWND) -> bool {
     unsafe { IsWindowVisible(hwnd).as_bool() }
+}
+
+/// Whether the visible part of `hwnd` is currently covered by another window.
+///
+/// Why this exists (2026-10-20, TapTap desktop client): an Electron window is
+/// `WS_EX_NOREDIRECTIONBITMAP`, so `uses_redirected_composition` routes it to the
+/// screen-DC `BitBlt` path. A screen-DC BitBlt samples whatever is *on screen* at
+/// those coordinates, so when the target sat behind the Harness window the
+/// captured JPEG showed the Harness chat instead of TapTap — while the tool still
+/// reported `ok`. Feeding a different window's pixels to the model is worse than
+/// failing: it reads as a successful observation and every later decision is
+/// made against the wrong screen.
+///
+/// The check samples the corners and centre of the client rect with
+/// `WindowFromPoint`, which returns the topmost window at a point regardless of
+/// which thread owns it. A target that owns every sample is unobstructed. Windows
+/// belonging to the target's own process count as the target, so child controls,
+/// popups and overlays do not register as occlusion.
+pub fn is_covered(hwnd: HWND) -> bool {
+    is_covered_detail(hwnd)["covered"].as_bool().unwrap_or(false)
+}
+
+/// Same check as [`is_covered`], but reports every sample so a disagreement
+/// between "the window looks covered" and "the check says clear" can be read off
+/// the payload instead of guessed at.
+pub fn is_covered_detail(hwnd: HWND) -> Value {
+    let Ok((left, top, width, height)) = window_rect(hwnd) else {
+        return json!({"covered": false, "error": "window_rect failed"});
+    };
+    if width <= 0 || height <= 0 {
+        return json!({"covered": false, "error": "empty rect"});
+    }
+    let mut target_pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut target_pid)) };
+    let target_root = root_hwnd(hwnd);
+    // Corners sit just inside the frame; the centre catches a window parked over
+    // the middle. Sampling the exact edge would hit the resize border.
+    let inset_x = (width / 20).max(1);
+    let inset_y = (height / 20).max(1);
+    let samples = [
+        (left + inset_x, top + inset_y),
+        (left + width - inset_x, top + inset_y),
+        (left + inset_x, top + height - inset_y),
+        (left + width - inset_x, top + height - inset_y),
+        (left + width / 2, top + height / 2),
+    ];
+    let mut rows = Vec::new();
+    let mut covered = false;
+    for (x, y) in samples {
+        let hit = unsafe { WindowFromPoint(windows::Win32::Foundation::POINT { x, y }) };
+        let hit_pid = if hit.0.is_null() {
+            0
+        } else {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hit, Some(&mut pid)) };
+            pid
+        };
+        let same_window = hit == hwnd || (!hit.0.is_null() && root_hwnd(hit) == target_root);
+        let same_process = hit_pid != 0 && hit_pid == target_pid;
+        let blocked = !hit.0.is_null() && !same_window && !same_process;
+        if blocked {
+            covered = true;
+        }
+        rows.push(json!({
+            "x": x, "y": y, "hitPid": hit_pid, "sameWindow": same_window,
+            "sameProcess": same_process, "covered": blocked,
+        }));
+    }
+    json!({
+        "covered": covered,
+        "targetPid": target_pid,
+        "rect": {"x": left, "y": top, "width": width, "height": height},
+        "samples": rows,
+    })
 }
 
 pub fn root_hwnd(hwnd: HWND) -> HWND {

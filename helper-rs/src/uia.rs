@@ -785,6 +785,21 @@ enum Job {
         index: i32,
         resp: Sender<UiaResult<Vec<String>>>,
     },
+    /// Resolve a previously observed element index to its UIA runtime id.
+    ///
+    /// Needed by callers that re-observe between steps (`fill_form`): the walk
+    /// renumbers every node, so an index handed in against the *previous*
+    /// snapshot no longer names the same control. The runtime id is stable
+    /// across renumbering, which makes it the only safe handle to carry over.
+    RuntimeId {
+        index: i32,
+        resp: Sender<UiaResult<Vec<i32>>>,
+    },
+    /// Find the current index of the element carrying `runtime_id`.
+    IndexOf {
+        runtime_id: Vec<i32>,
+        resp: Sender<UiaResult<Option<i32>>>,
+    },
     Diagnostics {
         resp: Sender<serde_json::Value>,
     },
@@ -964,6 +979,34 @@ impl UiaClient {
             .send(Job::CachedActions { index, resp: resp_tx })
             .map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?;
         resp_rx.recv().map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?
+    }
+
+    /// The UIA runtime id of a node observed by the latest walk.
+    ///
+    /// Callers that re-observe mid-operation (`fill_form` re-establishes its
+    /// element cache before running the steps) must carry runtime ids, not
+    /// indices: every walk renumbers the tree from zero, so an index that named
+    /// the verification-code box before a refresh can name the phone-number box
+    /// after it — which is exactly how a login form gets mangled.
+    pub fn runtime_id(&self, index: i32) -> UiaResult<Vec<i32>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::RuntimeId { index, resp: resp_tx })
+            .map_err(|_| format!("element {index} {RUNTIME_ID_MISMATCH}"))?;
+        resp_rx.recv().map_err(|_| format!("element {index} {RUNTIME_ID_MISMATCH}"))?
+    }
+
+    /// The index that currently names `runtime_id`, or `None` when the control
+    /// left the tree (the page re-rendered it away).
+    pub fn index_of(&self, runtime_id: &[i32]) -> UiaResult<Option<i32>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::IndexOf {
+                runtime_id: runtime_id.to_vec(),
+                resp: resp_tx,
+            })
+            .map_err(|_| "uia engine is not running".to_string())?;
+        resp_rx.recv().map_err(|_| "uia engine is not running".to_string())?
     }
 
     pub fn diagnostics(&self) -> serde_json::Value {
@@ -1215,6 +1258,26 @@ fn monitor_loop(rx: Receiver<Job>) {
                     .ok_or_else(|| format!("element {index} {NO_CACHED_SECONDARY}"));
                 let _ = resp.send(result);
             }
+            Job::RuntimeId { index, resp } => {
+                let result = engine
+                    .as_ref()
+                    .and_then(|eng| eng.runtime_ids.get(&index).cloned())
+                    .ok_or_else(|| format!("element {index} {RUNTIME_ID_MISMATCH}"));
+                let _ = resp.send(result);
+            }
+            Job::IndexOf { runtime_id, resp } => {
+                let result = match engine.as_ref() {
+                    Some(eng) => Ok(eng
+                        .runtime_ids
+                        .iter()
+                        .find(|(_, id)| **id == runtime_id)
+                        .map(|(index, _)| *index)),
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
             Job::Diagnostics { resp } => {
                 if let Some(eng) = engine.as_mut() {
                     eng.apply_invalidate();
@@ -1281,6 +1344,12 @@ fn fail_job(job: Job, err: &str) {
         }
         Job::CachedActions { resp, index } => {
             let _ = resp.send(Err(format!("element {index} {NO_CACHED_SECONDARY}")));
+        }
+        Job::RuntimeId { resp, index } => {
+            let _ = resp.send(Err(format!("element {index} {RUNTIME_ID_MISMATCH}")));
+        }
+        Job::IndexOf { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
         }
         Job::Diagnostics { resp } => {
             let mut payload = diagnostics_payload(None);
