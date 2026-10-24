@@ -44,7 +44,7 @@ $helperBin = Join-Path $PluginRoot "helper-rs\bin\win32-x64\dsh-computer-use.exe
 if (Test-Path $helperBin) {
   $labelOut = icacls $helperBin 2>&1 | Out-String
   $hasLow = $labelOut -match 'Low Mandatory Level'
-  $intMsg = if ($hasLow) { "警告: helper.exe 带有 Low 完整性标签，请先运行 fix-computer-use-integrity.ps1" } else { "helper.exe 完整性正常 (High/Unlabeled)" }
+  $intMsg = if ($hasLow) { "警告: helper.exe 带有 Low 完整性标签，先 icacls 去掉再重跑（fix-computer-use-integrity.ps1 已从仓库清出）" } else { "helper.exe 完整性正常 (High/Unlabeled)" }
   Record-Result "HelperIntegrity" (-not $hasLow) $intMsg
 } else {
   Record-Result "HelperBinary" $false "helper.exe 缺失，请先 cargo build --release"
