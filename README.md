@@ -28,7 +28,6 @@ English | [中文](README.zh-CN.md)
 - [Tool surface](#tool-surface)
 - [The act-and-refresh loop](#the-act-and-refresh-loop)
 - [Safety model](#safety-model)
-- [Experience layer](#experience-layer)
 - [Configuration](#configuration)
 - [Browser automation](#browser-automation)
 - [Verification](#verification)
@@ -51,7 +50,6 @@ English | [中文](README.zh-CN.md)
 | **Verified against the real thing** | Behaviour is gated against the official plugin and its helper: AX tree grammar, overlay pixels, cursor motion, capture freshness, transport budgets, approval strings, turn lifecycle. |
 | **Harness-native, not MCP-shaped** | DSH tools with a bundled skill, not a JavaScript REPL. The plugin is a DSH **bundle**: `package.json` + `cordis.patch.yml` + entry modules at the package root. |
 | **Two planes, one sidecar** | The desktop is process-wide, so the pointer, overlay, capture and approvals live on the HOST plane; the model-facing tools live in an agent preset, so an ordinary coding session never gets the mouse. |
-| **An experience layer** | Local, machine-specific notes written after a task and replayed as advisory context before the next one — see [Experience layer](#experience-layer). |
 
 ---
 
@@ -235,42 +233,6 @@ Read the shipped policy before extending the tool surface: `skills/computer-use/
 
 ---
 
-## Experience layer
-
-Every Computer Use run leaves two kinds of records behind, and the next run reads them before acting:
-
-| | Lessons (model-written) | Observations (machine-written) |
-|---|---|---|
-| Content | symptom, context, suspected cause, workaround, outcome, tags, date | method, ok/error, app, accessibility presence, window geometry, timing |
-| Who writes | the model, at the end of a task | the plugin, on every call |
-| Trust | prose with inference - **advisory only** | facts, no interpretation |
-
-Where it lives (inside the plugin folder, gitignored, never published):
-
-```text
-.experience/
-  lessons.jsonl      one JSON record per note (the canonical store)
-  lessons.md         the same notes rendered for humans, grouped by app
-  observations.jsonl machine-written facts
-  pending.jsonl      problems nobody wrote up yet
-  manual.jsonl       optional, hand-written, never rewritten by the plugin
-```
-
-**How it reaches the model.** The first observation of an app in a turn carries one extra advisory text block:
-
-```text
-Experience notes for blender.exe - machine-local notes from earlier tasks here.
-ADVISORY ONLY: not rules and not a gate. An upgrade, a DPI or configuration change can
-invalidate them, and the current observation always wins over a stored note.
-- 2026-09-14 [partial] accessibility was null in 11 of 13 observations -> prefer the app scripting interface
-```
-
-The note travels as its own block, so the official payload keeps its exact key set (`window`, `screenshots`, `accessibility`, `cacheDiagnostics`).
-
-**Advisory by construction, not by wording.** A note can never block, replace or gate a call; notes older than `staleAfterDays` are marked; a note that proves correct again is refreshed with `verified`; a note replaced by a better one is retired with `supersededBy`; and the model is told that **the current observation always wins**.
-
-**Privacy.** Typed text, element names, element values and screenshot bytes never reach these files. Error strings are path-redacted (`C:/Users/name/...` becomes `%USERPROFILE%`) and truncated. Turn the whole layer off with `experience.enabled: false` or `DSH_CU_EXPERIENCE=off`.
-
 ---
 
 ## Configuration
@@ -290,20 +252,6 @@ The note travels as its own block, so the official payload keeps its exact key s
 | `allowedApps` | `[]` | Non-empty means only these app ids may be observed or driven |
 | `envAllowlist` | `[]` | Extra environment names forwarded to the helper on top of the shipped allow list |
 | `overlayCaptureExclusion` | `mask` | How the status pill is kept out of the model's screenshots: `mask` hides it in the compositor for the duration of one capture (you keep seeing it), `wda` applies `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` instead, `off` leaves the pill in the frame |
-
-### Experience layer (`experience.*` on the same row)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `enabled` | `true` | Master switch for reading and writing notes |
-| `store` | `""` | Empty means `<pluginRoot>/.experience` |
-| `captureObservations` | `true` | Write the machine-observed facts |
-| `injectDigest` | `true` | Attach the advisory block to the first observation of a matching app |
-| `maxEntries` / `maxChars` | `3` / `900` | Injection budget |
-| `staleAfterDays` | `90` | Notes older than this are marked as possibly outdated |
-| `includeStale` | `true` | `false` drops stale notes from the digest entirely |
-| `retainEntries` / `retainObservationDays` | `200` / `30` | Retention |
-| `redactPaths` | `true` | Redact local profile paths in recorded error text |
 
 ### PRESET plane (the `dsh-computer-use/tool` row)
 
@@ -331,7 +279,7 @@ Everything is reproducible from this repository. Plugin-plane gates need no desk
 
 ```sh
 # from a DeepSeek Harness checkout, so the peer dependencies resolve
-node --import tsx/esm --test tests/contracts.test.mjs tests/experience.test.mjs
+node --import tsx/esm --test tests/contracts.test.mjs tests/interactive_summary.test.mjs
 
 # helper (Rust)
 cargo test --release --manifest-path helper-rs/Cargo.toml
@@ -343,7 +291,7 @@ python -m pytest -q
 node src/smoke.mjs
 ```
 
-Current state on Windows 11 x64: **plugin gates 38/38** (25 contract + 13 experience), **Rust 202 passed**, **Python 289 passed / 1 skipped**, fake-backend smoke green.
+Current state on Windows 11 x64: **plugin gates 25/25 contract**, **Rust 231 passed**, **Python 326 passed / 4 skipped**, fake-backend smoke green.
 
 The parity suite drives the real desktop and compares this plugin against the official one — overlay pixels, cursor motion, capture freshness, window-state cases, transport budgets, AX tree bytes, plugin lifecycle:
 
@@ -388,7 +336,6 @@ src/
   index.js              HOST service: sidecar lifetime, turn lifecycle, health
   tool.js               PRESET row: tool registration, approvals, documentation gate
   sidecar.js            helper transport: spawn, JSON-RPC, budgets, routing
-  experience.js         the experience layer: store, digest, observations, pending
   prompt.js             always-on prompt section + on-demand reference inventory
   paths.js              helper/python discovery
 skills/
@@ -427,7 +374,6 @@ docs/                   plugin readmes and assets
 
 - **The agent controls the real mouse, keyboard and screen.** Run Computer Use in a session where that is acceptable, and keep the deny list intact.
 - **Approvals are explicit.** `launch_app` and audio recording can pause for the harness approval UI; nothing is approved silently, and a refusal is never retried.
-- **The experience store is local and bounded.** It lives inside the plugin folder, is gitignored, is never packed, and never records typed text, element names or screenshot bytes.
 - **Screenshots are vision parts.** They travel to the model as image attachments; the JSON tool result carries no base64.
 - **Untrusted content stays untrusted.** Pages, documents and mail can inform the model but cannot authorise an action.
 

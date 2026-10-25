@@ -217,9 +217,17 @@ class HelperSourceContracts(unittest.TestCase):
         self.assertNotIn("input::paste_text(&value)?", main)
 
     def test_uia_set_value_falls_back_to_replace_text(self) -> None:
+        """The fallback lives on the CALLER's thread (audit P2-4, 2026-10-25).
+
+        The UIA monitor thread used to run the select-all + paste fallback
+        itself, queueing every other UIA request behind synthetic typing.
+        The engine now reports the miss and `main.rs` performs the replace.
+        """
         uia = (self.helper / "uia.rs").read_text(encoding="utf-8")
-        self.assertIn("crate::input::replace_text_for(", uia)
+        self.assertNotIn("crate::input::replace_text_for(", uia)
         self.assertNotIn("crate::input::paste_text(value)", uia)
+        main = (self.helper / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("input::replace_text_for(", main)
 
     def test_keyboard_input_suppresses_the_ime(self) -> None:
         inp = (self.helper / "input.rs").read_text(encoding="utf-8")

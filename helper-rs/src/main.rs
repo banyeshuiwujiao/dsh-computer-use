@@ -1031,21 +1031,29 @@ const LANDING_SETTLE_MS: u64 = 300;
 /// [`text_landed`], re-read once after [`LANDING_SETTLE_MS`] when the first pass
 /// said `Absent`.
 ///
-/// Only `Absent` is worth a second look: it means "readable control, text
-/// missing", and a slow commit is exactly that case. `Landed` is settled, and
-/// `Unverifiable` will never change no matter how long we wait, so both return
+/// `Absent` means "readable control, text missing", and a slow commit is
+/// exactly that case. An `Unverifiable` whose *before* value was readable gets
+/// the same second look (audit P1-3, 2026-10-25): a stale asynchronous commit
+/// reads exactly like a swallowed paste — the focused value is unchanged — and
+/// one settle read can upgrade it to a proven `Landed`/`Wrong` instead of a
+/// silent success. An `Unverifiable` from an unreadable target (`before` is
+/// `None`) can never change no matter how long we wait, so it returns
 /// immediately — which is what keeps a `type_text` into a web document fast.
 fn text_landed_settling(wid: isize, text: &str, before_fv: &Option<String>) -> Landing {
     let first = text_landed(wid, text, before_fv);
     // A wrong landing is settled too, and not by waiting: what is there is not
     // what we typed. Re-reading would only paste it again, so return at once and
     // let the caller report it.
-    if first != Landing::Absent {
+    let retry_unverifiable = first == Landing::Unverifiable && before_fv.is_some();
+    if first != Landing::Absent && !retry_unverifiable {
         return first;
     }
     std::thread::sleep(Duration::from_millis(LANDING_SETTLE_MS));
     match text_landed(wid, text, before_fv) {
         Landing::Landed => Landing::Landed,
+        // A proven wrong landing must surface, not hide behind Unverifiable's
+        // "counts as success when the focus accepts text".
+        proven @ Landing::Wrong if retry_unverifiable => proven,
         _ => first,
     }
 }

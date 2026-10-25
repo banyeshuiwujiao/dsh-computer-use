@@ -28,7 +28,6 @@
 - [工具面](#工具面)
 - [观察—动作—刷新循环](#观察动作刷新循环)
 - [安全模型](#安全模型)
-- [经验层](#经验层)
 - [配置](#配置)
 - [浏览器自动化](#浏览器自动化)
 - [验证](#验证)
@@ -51,7 +50,6 @@
 | **对照真机验证** | 行为对着官方插件与其 helper 做门禁：AX 树语法、覆盖层像素、光标运动、截图新鲜度、传输预算、批准文案、回合生命周期。 |
 | **Harness 原生，不是 MCP 套壳** | DSH 工具 + 随包技能，而不是一个 JavaScript REPL。插件本身是一个 DSH **bundle**：`package.json` + `cordis.patch.yml` + 包根目录下的入口模块。 |
 | **双平面、单 sidecar** | 桌面是进程级资源：指针、覆盖层、截图与批准流放在 HOST 平面；模型可见的工具放在 agent preset，普通编码会话不会拿到鼠标。 |
-| **经验层** | 任务结束后写入本机笔记，下一次任务执行前作为参考回放 —— 见[经验层](#经验层)。 |
 
 ---
 
@@ -139,7 +137,7 @@ flowchart TB
   subgraph DSH["DSH profile"]
     direction TB
     subgraph HOST["HOST 平面 — 进程级"]
-      S["dsh-computer-use<br/>服务 `dshComputerUse`<br/>指针 · 覆盖层 · 截图 · 批准<br/>回合生命周期 · 经验层"]
+      S["dsh-computer-use<br/>服务 `dshComputerUse`<br/>指针 · 覆盖层 · 截图 · 批准<br/>回合生命周期"]
     end
     subgraph PRESET["PRESET 平面 — 每个 agent preset"]
       T["dsh-computer-use/tool<br/>13 个 window2 工具<br/>+ harness 扩展"]
@@ -191,7 +189,7 @@ flowchart TB
 | `click_element`、`scroll_element` | 需显式开启 | 旧版 window-v1 别名 |
 | `session_note`、`session_state`、`diagnostic_state`、`end_turn` | 诊断 | 会话草稿、状态转储与回合控制 |
 
-想确认到底挂上了什么，最快的办法是 `computer_use_health`：后端、暴露的工具目录、批准策略、注入了哪些环境变量、文档门禁，经验层状态，以及覆盖层诊断（当前用哪条药丸渲染路径、推了多少帧、系统光标是否被压制、当前用哪种防捕获模式、此刻是否正处于截图遮蔽中）。
+想确认到底挂上了什么，最快的办法是 `computer_use_health`：后端、暴露的工具目录、批准策略、注入了哪些环境变量、文档门禁，以及覆盖层诊断（当前用哪条药丸渲染路径、推了多少帧、系统光标是否被压制、当前用哪种防捕获模式、此刻是否正处于截图遮蔽中）。
 
 ---
 
@@ -235,44 +233,6 @@ sequenceDiagram
 
 ---
 
-## 经验层
-
-每次 Computer Use 运行都会留下两类记录，下一次运行开始前会读到它们：
-
-| | 经验条目（模型写） | 观测记录（机器写） |
-|---|---|---|
-| 内容 | 症状、上下文、原因推测、绕法、结果、标签、日期 | 方法、成功/错误、应用、无障碍树是否存在、窗口几何、耗时 |
-| 谁写 | 模型，在任务结束时 | 插件，每次调用都写 |
-| 可信度 | 含推断的叙述 —— **仅供参考** | 事实，不做解读 |
-
-存放位置（在插件目录内，已 gitignore，永不发布）：
-
-```text
-.experience/
-  lessons.jsonl      一行一条经验（规范存储）
-  lessons.md         同一批笔记的人类可读视图，按应用分组
-  observations.jsonl 机器写的事实
-  pending.jsonl      还没被写下来的问题
-  manual.jsonl       可选，手写，插件永不改写
-```
-
-**如何到达模型。** 一个回合内对某应用的首次观察会额外带一条参考文本块：
-
-```text
-Experience notes for blender.exe - machine-local notes from earlier tasks here.
-ADVISORY ONLY: not rules and not a gate. An upgrade, a DPI or configuration change can
-invalidate them, and the current observation always wins over a stored note.
-- 2026-09-14 [partial] accessibility was null in 11 of 13 observations -> prefer the app scripting interface
-```
-
-它以独立文本块的形式送达，官方 payload 的键集保持不变（`window`、`screenshots`、`accessibility`、`cacheDiagnostics`）。
-
-**「仅供参考」是靠机制而不是靠措辞。** 任何条目都不能阻塞、替换或门禁一次调用；超过 `staleAfterDays` 的条目标记为可能过期；再次被验证有效的条目会刷新 `verified`；被更好解法取代的条目用 `supersededBy` 退役；并且明确告知模型：**当前观察永远优先**。
-
-**隐私。** 输入文本、控件名、控件值与截图字节永不落盘。错误文本会脱敏（`C:/Users/name/...` 变成 `%USERPROFILE%`）并截断。用 `experience.enabled: false` 或 `DSH_CU_EXPERIENCE=off` 可以整体关闭。
-
----
-
 ## 配置
 
 ### HOST 平面（`cordis.patch.yml` 的 `computer-use` 行）
@@ -290,20 +250,6 @@ invalidate them, and the current observation always wins over a stored note.
 | `allowedApps` | `[]` | 非空时只有这些 app id 可被观察或驱动 |
 | `envAllowlist` | `[]` | 在随包允许列表之外额外转发给 helper 的环境变量名 |
 | `overlayCaptureExclusion` | `mask` | 状态药丸如何避开模型看到的截图：`mask`（默认）在单次捕获期间用合成器隐藏药丸，操作者始终能看到；`wda` 改用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`；`off` 不排除，药丸会出现在截图里 |
-
-### 经验层（同一行上的 `experience.*`）
-
-| 键 | 默认 | 含义 |
-|---|---|---|
-| `enabled` | `true` | 读写笔记的总开关 |
-| `store` | `""` | 空表示 `<pluginRoot>/.experience` |
-| `captureObservations` | `true` | 是否写机器观测事实 |
-| `injectDigest` | `true` | 是否把参考块附在匹配应用的首次观察上 |
-| `maxEntries` / `maxChars` | `3` / `900` | 注入预算 |
-| `staleAfterDays` | `90` | 超过这个天数的条目标记为可能过期 |
-| `includeStale` | `true` | 设为 `false` 时过期条目完全不注入 |
-| `retainEntries` / `retainObservationDays` | `200` / `30` | 保留策略 |
-| `redactPaths` | `true` | 对记录下来的错误文本做本地路径脱敏 |
 
 ### PRESET 平面（`dsh-computer-use/tool` 行）
 
@@ -331,7 +277,7 @@ invalidate them, and the current observation always wins over a stored note.
 
 ```sh
 # 在 DeepSeek Harness checkout 下运行，以便解析 peer 依赖
-node --import tsx/esm --test tests/contracts.test.mjs tests/experience.test.mjs
+node --import tsx/esm --test tests/contracts.test.mjs tests/interactive_summary.test.mjs
 
 # helper（Rust）
 cargo test --release --manifest-path helper-rs/Cargo.toml
@@ -343,7 +289,7 @@ python -m pytest -q
 node src/smoke.mjs
 ```
 
-当前状态（Windows 11 x64）：**插件门禁 38/38**（25 条契约 + 13 条经验层）、**Rust 202 通过**、**Python 289 通过 / 1 跳过**、fake 后端冒烟通过。
+当前状态（Windows 11 x64）：**插件契约门禁 25/25**、**Rust 231 通过**、**Python 326 通过 / 4 skipped**，fake-backend 冒烟绿。
 
 parity 套件会操作真实桌面，把本插件与官方实现逐项对比 —— 覆盖层像素、光标运动、截图新鲜度、window-state 用例、传输预算、AX 树字节、插件生命周期：
 
@@ -388,7 +334,6 @@ src/
   index.js              HOST 服务：sidecar 生命周期、回合生命周期、health
   tool.js               PRESET 行：工具注册、批准、文档门禁
   sidecar.js            helper 传输：启动、JSON-RPC、预算、路由
-  experience.js         经验层：存储、digest、观测、待补记
   prompt.js             常驻提示词段 + 按需参考文档清单
   paths.js              helper / python 发现逻辑
 skills/
@@ -426,7 +371,6 @@ docs/                   插件说明与图片资源
 
 - **Agent 控制的是真实的鼠标、键盘与屏幕。** 请只在你能接受这一点的会话里使用 Computer Use，并保持拒绝清单完整。
 - **批准是显式的。** `launch_app` 与音频录制会暂停等待 harness 批准 UI；没有任何动作会被静默批准，被拒绝的请求也绝不重试。完全访问（或批准策略为「从不询问」）的会话除外：那是用户自己的选择，插件按 `allow` 放行并留下审计记录。
-- **经验层是本机且有界的。** 它位于插件目录内、已 gitignore、永不打包，也永不记录输入文本、控件名或截图字节。
 - **截图是视觉 part。** 它们以图片附件形式送达模型，JSON 工具结果里不含 base64。
 - **不可信内容始终不可信。** 网页、文档与邮件可以给模型提供信息，但无权授权任何动作。
 

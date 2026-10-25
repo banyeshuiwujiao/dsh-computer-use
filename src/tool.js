@@ -88,13 +88,8 @@ export const Config = Schema.object({
   // common round-trip sink (each field costs an observe→act→observe cycle), and
   // the guidance now names it as the preferred path for 2+ field forms.
   enabledTools: Schema.array(Schema.string()).default(['batch_actions', 'scroll_element', 'fill_form']),
-  /**
-   * Which agent preset this tool row is mounted under (V2 experience scope).
-   * The experience layer filters notes by it: a note recorded under one preset never
-   * injects into another. Empty means "unknown" - scoped notes fail closed and only
-   * unscoped ('all') notes inject.
-   */
-  preset: Schema.string().default(''),
+  // `preset` (V2 experience scope) was removed with the experience layer
+  // (commits 0b11afb/bd2ef99); the option had no consumer left. Audit P2-10.
 })
 
 const OUTPUT_SCHEMA = {
@@ -419,7 +414,16 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       if (TEXT_SELECTOR_TOOLS.has(spec.name)) {
         const targetText = typeof input.text === 'string' ? input.text.trim() : ''
         if (targetText && input.element_index === undefined && (input.x === undefined || input.y === undefined)) {
-          if (state.lastElements && state.lastElements.length > 0) {
+          // Audit P1-4 (2026-10-25): the cached indices belong to ONE observed
+          // window. Matching text against them for a *different* window silently
+          // clicks the wrong control, so the cache is only consulted when the
+          // caller's window matches the observation (or names no window at all).
+          const cacheForThisWindow = state.lastElements && state.lastElements.length > 0
+            && (!input.window || typeof input.window !== 'object' || !state.lastWindow
+              || (String(input.window.app || '') === String(state.lastWindow.app || '')
+                && (input.window.id === undefined || state.lastWindow.id === undefined
+                  || input.window.id === state.lastWindow.id)))
+          if (cacheForThisWindow) {
             const matched = state.lastElements.find(e => e.name && e.name.toLowerCase().includes(targetText.toLowerCase()))
               || state.lastElements.find(e => e.raw && e.raw.toLowerCase().includes(targetText.toLowerCase()))
             if (matched) {
@@ -485,6 +489,11 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       const value = result?.value ?? result
       if (spec.name === 'get_window_state' && value?.accessibility?.tree) {
         state.lastElements = extractInteractiveElements(value.accessibility.tree)
+        // Remember which window those indices describe (audit P1-4): text
+        // selection must never resolve against another window's observation.
+        state.lastWindow = input && typeof input.window === 'object'
+          ? { app: input.window.app, id: input.window.id, title: input.window.title }
+          : null
       }
       const refs = await admitImages(ctx, result?.images || [])
       return { value, images: refs }
@@ -820,19 +829,27 @@ export function formatWindowStateBody(body) {
   }
 
   let safeBody = body
+  const axOverrides = {}
   if (typeof ax.document_text === 'string' && ax.document_text.length > 600) {
     const total = ax.document_text.length
-    const trimmed =
+    axOverrides.document_text =
       ax.document_text.slice(0, 250) +
       `\n... [document_text trimmed: ${total} total characters to prevent middle pruning; see tree for structure] ...\n` +
       ax.document_text.slice(-150)
-    safeBody = {
-      ...body,
-      accessibility: {
-        ...ax,
-        document_text: trimmed,
-      },
-    }
+  }
+  // Audit P2-11 (2026-10-25): the raw tree was shipped whole. Deep windows
+  // (IDEs, browsers) push past 100k characters, and the interactive summary
+  // above already carries what element_index targeting needs, so the raw tree
+  // gets a middle-trim budget of its own instead of a free ride.
+  if (typeof ax.tree === 'string' && ax.tree.length > 24_000) {
+    const total = ax.tree.length
+    axOverrides.tree =
+      ax.tree.slice(0, 20_000) +
+      `\n... [tree trimmed: ${total} total characters; ${total - 22_000} middle characters dropped. Re-run get_window_state with a narrower scope if the element you need is gone] ...\n` +
+      ax.tree.slice(-2_000)
+  }
+  if (Object.keys(axOverrides).length > 0) {
+    safeBody = { ...body, accessibility: { ...ax, ...axOverrides } }
   }
 
   return header + summary + stringifyCompact(safeBody)
@@ -855,7 +872,10 @@ function renderValue(value) {
 
 function stringifyCompact(value) {
   try {
-    return JSON.stringify(value, null, 2)
+    // Audit P2-11: pretty-printing doubled the payload size of every
+    // get_window_state result for zero reader benefit — the model consumes
+    // JSON, it does not need indentation.
+    return JSON.stringify(value)
   } catch {
     return String(value)
   }

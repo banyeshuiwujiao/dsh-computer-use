@@ -54,7 +54,13 @@ class ToolExecutor:
     def execute(self, name: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if name not in self.tool_names:
             raise KeyError(f"unknown tool {name}")
-        spec = dict(arguments or {})
+        # Underscore-prefixed keys are an internal channel (composite actions
+        # marking their inner steps as lease-validated); callers are the model,
+        # so they must never be able to inject them. Strip before dispatch.
+        spec = {k: v for k, v in dict(arguments or {}).items() if not str(k).startswith("_")}
+        return self._execute(name, spec, already_leased=False)
+
+    def _execute(self, name: str, spec: dict[str, Any], *, already_leased: bool = False) -> dict[str, Any]:
         canonical = ALIASES.get(name, name)
         if canonical == "get_window_state" and name == "observe":
             spec.setdefault("include_screenshot", True)
@@ -62,9 +68,12 @@ class ToolExecutor:
         # A composite action (fill_form) validates the lease once up front; its
         # inner steps must not re-validate, otherwise an intervening observation
         # of a *different* window (the overlay, a popup, a refresh) fails every
-        # remaining step with "last get_window_state was window id X".
-        inner = spec.pop("_lease_ok", False)
-        result = self._dispatch(canonical, spec, lease_ok=inner)
+        # remaining step with "last get_window_state was window id X". The flag
+        # is injected here, one layer *inside* the public boundary, so it can
+        # only originate from fill_form itself.
+        if already_leased:
+            spec = {**spec, "_lease_ok": True}
+        result = self._dispatch(canonical, spec, lease_ok=already_leased)
         if canonical in VOID_COMPUTER:
             result = None
         return {"name": name, "canonical": canonical, "result": result, "observation": None}
@@ -196,10 +205,17 @@ class ToolExecutor:
         # itself when it has nothing on record, instead of failing closed.
         if not lease_ok:
             target = spec.get("window")
-            if isinstance(target, dict) and self.driver.lease.observed_at is None:
+            # Audit P2-2 (2026-10-25): without a window there is nothing to
+            # observe and nothing to validate — a fill would drive input blind
+            # into whatever happens to be focused. Fail closed instead.
+            if not isinstance(target, dict):
+                raise ValueError(
+                    "fill_form needs a \"window\" object (the same one get_window_state "
+                    "returned) so the lease can be validated; omitting it would fill blind"
+                )
+            if self.driver.lease.observed_at is None:
                 self.execute("get_window_state", {"window": target, "include_text": True})
-            if isinstance(target, dict):
-                self.driver.lease.require(target, "fill_form")
+            self.driver.lease.require(target, "fill_form")
         continue_on_error = spec.get("continue_on_error") is True
         results: list[dict[str, Any]] = []
         failed = False
@@ -238,7 +254,11 @@ class ToolExecutor:
                 failed = True
                 continue
             try:
-                outcome = self.execute_call({**call, "arguments": {**call["arguments"], "_lease_ok": True}})
+                # Internal channel: already_leased marks the step as covered by
+                # fill_form's one up-front lease check. Injecting "_lease_ok"
+                # through execute_call would cross the public boundary, where
+                # the same key from a model call must be (and is) stripped.
+                outcome = self._execute(str(call["name"]), dict(call["arguments"]), already_leased=True)
             except Exception as exc:  # noqa: BLE001 - report, never abort the whole fill silently
                 results.append({"ok": False, "index": i, "action": action, "element_index": index,
                                 "error": str(exc)})

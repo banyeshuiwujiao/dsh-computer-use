@@ -34,7 +34,7 @@
     "url": "https://github.com/wushi2333/dsh-computer-use_codex-style/issues"
   },
   "scripts": {
-    "test:js": "node --test tests/contracts.test.mjs tests/experience.test.mjs tests/interactive_summary.test.mjs",
+    "test:js": "node --test tests/contracts.test.mjs tests/interactive_summary.test.mjs",
     "test:py": "python -m pytest tests",
     "test:ci": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/ci-smoke.ps1",
     "test": "npm run test:js && npm run test:py"
@@ -64,7 +64,11 @@
     "@deepseek-ai/schemastery": "*"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-user-approval": { "optional": true },
-    "@deepseek-ai/dsh-attachment": { "optional": true }
+    "@deepseek-ai/dsh-user-approval": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-attachment": {
+      "optional": true
+    }
   }
 }

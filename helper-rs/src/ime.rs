@@ -32,8 +32,9 @@
 use std::cell::Cell;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
+    GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
 };
 
 #[cfg(windows)]
@@ -88,6 +89,12 @@ fn install(hwnd: isize) -> Option<Saved> {
     }
     let h = HWND(hwnd as *mut core::ffi::c_void);
     unsafe {
+        // 0) Snapshot the target thread's *real* current layout. The owning
+        //    thread is the only authority on its own HKL; hard-coding an
+        //    English constant here would leave a Chinese layout switched to
+        //    English forever after the guard drops (audit P1-1, 2026-10-25).
+        let tid = GetWindowThreadProcessId(h, None);
+        let current = GetKeyboardLayout(tid).0 as isize;
         // 1) Ask the owning thread to switch to English (US). Posting is the
         //    documented cross-thread path; attaching to that thread is not
         //    allowed from an RPC-ish worker without a message queue.
@@ -102,7 +109,9 @@ fn install(hwnd: isize) -> Option<Saved> {
         let previous_imc = imm::ImmAssociateContext(h, 0);
         Some(Saved {
             hwnd,
-            previous_hkl: LANG_EN_US,
+            // A failed query (0) has nothing better to restore than EN-US;
+            // any real HKL — including EN-US itself — round-trips unchanged.
+            previous_hkl: if current == 0 { LANG_EN_US } else { current },
             previous_imc,
         })
     }

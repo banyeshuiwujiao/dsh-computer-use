@@ -988,15 +988,29 @@ pub fn is_covered_detail(hwnd: HWND) -> Value {
     let target_root = root_hwnd(hwnd);
     // Corners sit just inside the frame; the centre catches a window parked over
     // the middle. Sampling the exact edge would hit the resize border.
+    // Audit P2-6 (2026-10-25): five samples let a small popup (a captcha
+    // overlay, a dropdown) slip between them while WGC crops its pixels into
+    // the shot. Add a 3x3 interior grid on top of the classic five points so
+    // anything larger than a third of the window in either dimension must
+    // cover a sample. Still point-sampling, so a tiny tooltip can pass — but
+    // small enough to be cheap (14 WindowFromPoint calls).
     let inset_x = (width / 20).max(1);
     let inset_y = (height / 20).max(1);
-    let samples = [
+    let mut samples = vec![
         (left + inset_x, top + inset_y),
         (left + width - inset_x, top + inset_y),
         (left + inset_x, top + height - inset_y),
         (left + width - inset_x, top + height - inset_y),
         (left + width / 2, top + height / 2),
     ];
+    for fy in [4, 2, 1] {
+        for fx in [4, 2, 1] {
+            if fx == 2 && fy == 2 {
+                continue; // already the centre sample
+            }
+            samples.push((left + width * fx / 4, top + height * fy / 4));
+        }
+    }
     let mut rows = Vec::new();
     let mut covered = false;
     for (x, y) in samples {
@@ -1065,9 +1079,15 @@ fn foreground_is_target(hwnd: HWND) -> bool {
 }
 
 fn steal_foreground(hwnd: HWND) -> bool {
-    unsafe {
-        // Z-order before focus: the same maximized-sibling occlusion case.
+    // Z-order before focus — but only when something actually covers the
+    // target (audit P2-7, 2026-10-25): the unconditional TOPMOST flash ran on
+    // every activation, permanently reshuffling the user's z-order and waking
+    // tray-hidden windows. When nothing occludes the target, focus alone is
+    // enough and the z-order must stay untouched.
+    if is_covered(hwnd) {
         bump_to_top(hwnd);
+    }
+    unsafe {
         let fg = GetForegroundWindow();
         let mut fg_pid = 0u32;
         let fg_tid = GetWindowThreadProcessId(fg, Some(&mut fg_pid));
@@ -1173,7 +1193,9 @@ fn bump_to_top(hwnd: HWND) {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            // No SWP_SHOWWINDOW (audit P2-7): showing is not this bump's
+            // business, and it woke tray-hidden windows on every activation.
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
         let _ = SetWindowPos(
             hwnd,

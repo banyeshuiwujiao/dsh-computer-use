@@ -1084,10 +1084,12 @@ pub fn global() -> &'static UiaClient {
 impl UiaClient {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        thread::Builder::new()
+        // If the thread cannot even spawn, `rx` drops immediately and every
+        // request fails fast on the channel error instead of panicking here
+        // (audit P1-2: the helper must not die at init over one thread).
+        let _ = thread::Builder::new()
             .name("computer-use-uia-monitor".into())
-            .spawn(move || monitor_loop(rx))
-            .expect("spawn UIA monitor");
+            .spawn(move || monitor_loop(rx));
         Self { tx }
     }
 
@@ -1600,7 +1602,10 @@ fn monitor_loop(rx: Receiver<Job>) {
                 if let Ok(mut slot) = MONITOR_CURRENT.lock() {
                     *slot = Some((job_hwnd, Instant::now()));
                 }
-                match job {
+                // Audit P1-2 (2026-10-25): a panicking COM call must not kill the
+                // monitor thread — its death would leave MONITOR_CURRENT set and
+                // every later UIA request busy forever. Catch the unwind per job.
+                let job_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
             Job::Dump {
                 hwnd,
                 title,
@@ -1827,7 +1832,16 @@ fn monitor_loop(rx: Receiver<Job>) {
                 };
                 let _ = resp.send(result);
             }
-                };
+                }));
+                if job_result.is_err() {
+                    // The in-flight caller times out on its own request budget;
+                    // put the panicking window on the wedge cooldown so dumps for
+                    // it degrade to the placeholder tree instead of queueing.
+                    if let Ok(mut slot) = MONITOR_CURRENT.lock() {
+                        *slot = None;
+                    }
+                    mark_wedged(job_hwnd);
+                }
                 if let Ok(mut slot) = MONITOR_CURRENT.lock() {
                     *slot = None;
                 }
@@ -2565,7 +2579,6 @@ impl Engine {
             if readonly {
                 return Err(NOT_SETTABLE.to_string());
             }
-            let before = pat.CurrentValue().ok().map(bstr_to_string).unwrap_or_default();
             let bstr = BSTR::from(value);
             pat.SetValue(&bstr).map_err(|_| "set UIA value".to_string())?;
             // F2 (known limitation, NOT fully closeable via UIA): some controls —
@@ -2579,21 +2592,16 @@ impl Engine {
             // still catches providers that fail WITHOUT echoing.
             let echoed = pat.CurrentValue().ok().map(bstr_to_string).unwrap_or_default();
             if echoed != value {
-                // The provider did not take the write. Reproduce replace semantics:
-                // select-all then paste, never a bare paste (a bare paste appends at
-                // the caret and silently produces "old value + new text").
-                let _ = crate::input::replace_text_for(Some(hwnd), value);
-                if pat.CurrentValue().ok().map(bstr_to_string).as_deref() != Some(value) {
-                    return Err(
-                        "set_value reported success but the control's value did not change"
-                            .to_string(),
-                    );
-                }
-            } else if echoed == before && !before.is_empty() && before != value {
-                // Defensive: a provider that echoes the request but never applied it
-                // would look identical to success. Only worth a fallback when the
-                // requested value differs from what was already there.
-                let _ = crate::input::replace_text_for(Some(hwnd), value);
+                // The provider did not take the write. Audit P2-4 (2026-10-25):
+                // this runs on the UIA monitor thread, and the input fallback
+                // (clipboard + SendInput + sleeps) used to run here too, queueing
+                // every other UIA request behind synthetic typing. Return the
+                // error instead; the caller (main.rs set_value Err(_) branch)
+                // performs the same select-all + paste replace on its own thread.
+                return Err(
+                    "set_value reported success but the control's value did not change"
+                        .to_string(),
+                );
             }
             // Second, independent witness: a *rendered text* read. A controlled
             // input (React/Vue) or an IME can accept the write into the UIA value
@@ -2605,16 +2613,13 @@ impl Engine {
             if let Some(rendered) = text_pattern_of(&el) {
                 let rendered = rendered.replace('\r', "");
                 if !rendered.contains(value) {
-                    let _ = crate::input::replace_text_for(Some(hwnd), value);
-                    if let Some(again) = text_pattern_of(&el) {
-                        let again = again.replace('\r', "");
-                        if !again.contains(value) {
-                            return Err(format!(
-                                "set_value did not take: the field's text reads {:?}, not the value given",
-                                clip_text(&again, 40)
-                            ));
-                        }
-                    }
+                    // Audit P2-4: as above, the input replace must happen on the
+                    // caller's thread; report the miss and let the coordinate
+                    // fallback in main.rs do it.
+                    return Err(format!(
+                        "set_value did not take: the field's text reads {:?}, not the value given",
+                        clip_text(&rendered, 40)
+                    ));
                 }
             }
             return Ok(());

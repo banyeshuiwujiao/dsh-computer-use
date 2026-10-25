@@ -57,8 +57,11 @@ def lockapp_running() -> bool:
         user32.CloseDesktop(handle)
         if not ok:
             return False
+        # Blacklist, not whitelist (audit P2-3, 2026-10-25): pipelines and
+        # third-party tools legitimately create their own input desktops;
+        # treating every non-Default name as "locked" refused all input there.
         lower = name.value.lower()
-        return (lower != "default" and bool(lower)) or lower in {"winlogon", "screensavers", "screen-saver", "screensaver"}
+        return lower in {"winlogon", "screensavers", "screen-saver", "screensaver", "disconnect", "lock"}
     except (OSError, AttributeError):
         return False
 

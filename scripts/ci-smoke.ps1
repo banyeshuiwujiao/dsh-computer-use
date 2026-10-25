@@ -58,9 +58,9 @@ if (-not (Test-Path $nm) -and (Test-Path $sharedNm)) {
 }
 Record-Result "NodeModulesJunction" (Test-Path "$nm\@deepseek-ai\cordis") "已确保 node_modules 接线指向 profiles 依赖池"
 
-# 3. JS 契约与 Experience 单元测试
-Write-Host "`n--- 运行 JS 契约与经验测试 (node --test) ---" -ForegroundColor Yellow
-$jsOut = node --test "$PluginRoot\tests\contracts.test.mjs" "$PluginRoot\tests\experience.test.mjs" 2>&1
+# 3. JS 契约与交互摘要测试（experience 层已删除，见 docs/audit-fix-roadmap-2026-10-25.md P2-9）
+Write-Host "`n--- 运行 JS 契约测试 (node --test) ---" -ForegroundColor Yellow
+$jsOut = node --test "$PluginRoot\tests\contracts.test.mjs" "$PluginRoot\tests\interactive_summary.test.mjs" 2>&1
 $jsRc = $LASTEXITCODE
 $jsSummary = ($jsOut | Select-String -Pattern "ℹ (pass|fail|tests)" | ForEach-Object { $_.Line.Trim() }) -join ", "
 $jsMsg = if ($jsRc -eq 0) { "全部通过: $jsSummary" } else { "存在失败: $jsSummary" }

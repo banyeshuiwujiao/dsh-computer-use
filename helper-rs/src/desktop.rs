@@ -81,17 +81,15 @@ pub fn locked_message(name: &str) -> String {
 
 fn name_is_lock_desktop(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
-    // On Windows, the only normal user interactive desktop is "Default".
-    // Any input desktop other than "Default" (such as "Screen-saver",
-    // "Winlogon", "Disconnect") is by definition a locked/isolated system desktop.
-    (lower != "default" && !lower.is_empty())
-        || lower.contains("winlogon")
+    // Blacklist, not whitelist (audit P2-3, 2026-10-25): automation pipelines
+    // and third-party tools legitimately run on their own non-Default input
+    // desktops; only the known lock/secure-desktop names mean locked.
+    lower.contains("winlogon")
         || lower.contains("screensaver")
         || lower.contains("screen-saver")
         || lower.contains("disconnect")
         || lower == "lock"
         || lower.contains("lock screen")
-        || lower.contains("windows default")
 }
 
 pub fn foreground_pid() -> u32 {
