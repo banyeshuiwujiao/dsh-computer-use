@@ -128,6 +128,13 @@ additionalProperties:true 全透传——模型在普通 click 调用里带 `"_l
 
 验证：Python 324 pass/4 skip、JS 51 pass/1 skip、Rust 231 pass；二进制以 5ed0026 重建（2754048B）。
 
+## 第 4 批（收尾）进展 — 2026-10-25 完成：全部审计项闭环
+
+- **P1-2 根治：monitor watchdog + 线程重建** ✅：接收端共享化（MONITOR_RX，锁仅在 recv 期间持有）+ 代数标记（MONITOR_GEN/MONITOR_SERVED_BY）。watchdog 线程每秒检查，当前 job 卡超过 wedge_stuck_ms 时标记窗口 wedged 并拉起**新代 monitor** 继续服务——被卡死的 COM 线程被放弃（无法安全销毁，COM 调用返回后因代数过期自行退出，且不得清掉新 monitor 的在途记账）。代价（已注释说明）：新线程 = 新 Engine，元素缓存丢失，索引动作会以既有 runtime-id mismatch 报错、需重新观察——可存活的降级路径。每个卡死 job 只重建一次（SERVED_BY 判重）。
+- **P2-1 IME 恢复失败监督** ✅：`ime.rs` 新增 RESTORE_FAILURES 计数（Drop 恢复 PostMessageW 失败时递增，不再 `let _ =` 吞掉），`health` 载荷新增 `ime.restoreFailures`。注：“helper 被杀后残留 detach 的启动期恢复”不可行（HIMC 句柄跨进程无效），监督计数 + health 暴露即本项可交付范围。
+
+验证：Rust 232 pass（含新增代数推进测试）、Python 324 pass/4 skip；二进制以 c917741 重建（2769920B）。
+
 ## 修复推进批次（建议顺序）
 
 **第 1 批（P1，约 2-3 天）— 止血正确性**

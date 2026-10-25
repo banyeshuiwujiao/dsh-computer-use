@@ -30,6 +30,18 @@
 //! for those too.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Audit P2-1 (2026-10-25): restore failures used to be swallowed with `let _ =`
+/// — a window whose IME context or layout could not be restored (target died
+/// mid-guard, PostMessageW rejected, third-party IME misbehaving) left the user
+/// with no way to notice. Counted here and surfaced through `health` so a batch
+/// session that keeps breaking the user's IME is visible in diagnostics.
+static RESTORE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub fn restore_failure_count() -> u64 {
+    RESTORE_FAILURES.load(Ordering::Relaxed)
+}
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
@@ -159,13 +171,19 @@ impl Drop for ImeGuard {
                 if saved.hwnd != 0 {
                     let h = HWND(saved.hwnd as *mut core::ffi::c_void);
                     unsafe {
+                        // Audit P2-1: a failed restore is counted, not swallowed.
+                        // The window may be gone (fine) or a third-party IME may
+                        // be fighting the re-attach (needs operator attention).
                         let _ = imm::ImmAssociateContext(h, saved.previous_imc);
-                        let _ = PostMessageW(
+                        let posted = PostMessageW(
                             Some(h),
                             WM_INPUTLANGCHANGEREQUEST,
                             WPARAM(0),
                             LPARAM(saved.previous_hkl),
                         );
+                        if posted.is_err() {
+                            RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

@@ -532,6 +532,7 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                 "overlay": "dsh",
                 "helper": "dsh-computer-use",
                 "revision": BUILD_REVISION,
+                "ime": {"restoreFailures": dsh_computer_use::ime::restore_failure_count()},
                 "native": true,
                 "surface": st.surface,
                 "backend": st.backend,

@@ -1092,6 +1092,57 @@ pub struct UiaClient {
 
 static CLIENT: OnceLock<UiaClient> = OnceLock::new();
 
+// Audit P1-2 root fix (2026-10-25): a wedged COM call cannot be cancelled and
+// the thread it runs on cannot be safely destroyed, so the only way past a
+// permanently stuck provider is to ABANDON that thread and start a fresh
+// monitor on the shared receiver. `MONITOR_RX` is the shared queue (the lock
+// is held only while receiving, never while a job executes), `MONITOR_GEN` is
+// the current monitor generation, and `MONITOR_SERVED_BY` records which
+// generation owns the job in MONITOR_CURRENT — a superseded thread checks the
+// generation and exits instead of competing for jobs or clearing the new
+// monitor's bookkeeping.
+static MONITOR_RX: OnceLock<Mutex<Receiver<Job>>> = OnceLock::new();
+static MONITOR_GEN: AtomicU64 = AtomicU64::new(1);
+static MONITOR_SERVED_BY: AtomicU64 = AtomicU64::new(0);
+
+fn spawn_monitor() -> u64 {
+    let gen = MONITOR_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = thread::Builder::new()
+        .name(format!("computer-use-uia-monitor-{gen}"))
+        .spawn(move || monitor_loop(gen));
+    gen
+}
+
+/// Watchdog for the monitor thread: a job stuck past `wedge_stuck_ms` is never
+/// coming back on its own, so start a replacement monitor. The replacement
+/// only spawns once per stuck job (`MONITOR_SERVED_BY` still names the latest
+/// generation); the abandoned thread exits after its late COM call returns.
+/// Cost of a rebuild: a fresh `Engine` means the element cache is lost, so
+/// indexed actions fail with the usual runtime-id mismatch until the caller
+/// re-observes — the documented, survivable degradation.
+fn monitor_watchdog() {
+    thread::Builder::new()
+        .name("computer-use-uia-watchdog".into())
+        .spawn(|| loop {
+            thread::sleep(Duration::from_millis(1_000));
+            if MONITOR_RX.get().is_none() {
+                continue; // unit tests drive the wedge helpers without a client
+            }
+            let Some((busy_hwnd, started)) = MONITOR_CURRENT.lock().ok().and_then(|slot| *slot) else {
+                continue;
+            };
+            if busy_hwnd == 0 || started.elapsed() < Duration::from_millis(wedge_stuck_ms()) {
+                continue;
+            }
+            if MONITOR_SERVED_BY.load(Ordering::SeqCst) != MONITOR_GEN.load(Ordering::SeqCst) {
+                continue; // a replacement monitor is already running
+            }
+            mark_wedged(busy_hwnd);
+            spawn_monitor();
+        })
+        .ok();
+}
+
 pub fn global() -> &'static UiaClient {
     CLIENT.get_or_init(UiaClient::new)
 }
@@ -1099,12 +1150,9 @@ pub fn global() -> &'static UiaClient {
 impl UiaClient {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        // If the thread cannot even spawn, `rx` drops immediately and every
-        // request fails fast on the channel error instead of panicking here
-        // (audit P1-2: the helper must not die at init over one thread).
-        let _ = thread::Builder::new()
-            .name("computer-use-uia-monitor".into())
-            .spawn(move || monitor_loop(rx));
+        let _ = MONITOR_RX.set(Mutex::new(rx));
+        spawn_monitor();
+        monitor_watchdog();
         Self { tx }
     }
 
@@ -1580,12 +1628,15 @@ fn job_hwnd(job: &Job) -> isize {
     }
 }
 
-fn monitor_loop(rx: Receiver<Job>) {
+fn monitor_loop(gen: u64) {
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr.is_err() && hr != RPC_E_CHANGED_MODE {
         mark_monitor_setup(Err(INIT_COM_UIA.to_string()));
-        for job in rx {
-            fail_job(job, INIT_COM_UIA);
+        while MONITOR_GEN.load(Ordering::SeqCst) == gen {
+            match MONITOR_RX.get().and_then(|rx| rx.lock().ok()).map(|rx| rx.recv()) {
+                Some(Ok(job)) => fail_job(job, INIT_COM_UIA),
+                _ => break,
+            }
         }
         return;
     }
@@ -1606,8 +1657,20 @@ fn monitor_loop(rx: Receiver<Job>) {
         }
     };
     loop {
-        match rx.recv_timeout(Duration::from_millis(40)) {
-            Ok(job) => {
+        // A superseded monitor (the watchdog rebuilt around a stuck COM call on
+        // this thread) must not pick up more jobs or touch the new monitor's
+        // bookkeeping; it exits after its late call returns.
+        if MONITOR_GEN.load(Ordering::SeqCst) != gen {
+            break;
+        }
+        // The receiver lock is held ONLY while receiving. Holding it during a
+        // job would stop a replacement monitor from ever serving anything.
+        let msg = MONITOR_RX
+            .get()
+            .and_then(|rx| rx.lock().ok())
+            .map(|rx| rx.recv_timeout(Duration::from_millis(40)));
+        match msg {
+            Some(Ok(job)) => {
                 // AX-WEDGE: publish what the monitor is working on so a client that
                 // times out can attribute the stall, and clear the window's wedge
                 // entry when the job finishes (a stuck provider that eventually
@@ -1617,6 +1680,7 @@ fn monitor_loop(rx: Receiver<Job>) {
                 if let Ok(mut slot) = MONITOR_CURRENT.lock() {
                     *slot = Some((job_hwnd, Instant::now()));
                 }
+                MONITOR_SERVED_BY.store(gen, Ordering::SeqCst);
                 // Audit P1-2 (2026-10-25): a panicking COM call must not kill the
                 // monitor thread — its death would leave MONITOR_CURRENT set and
                 // every later UIA request busy forever. Catch the unwind per job.
@@ -1848,6 +1912,7 @@ fn monitor_loop(rx: Receiver<Job>) {
                 let _ = resp.send(result);
             }
                 }));
+                let superseded = MONITOR_GEN.load(Ordering::SeqCst) != gen;
                 if job_result.is_err() {
                     // The in-flight caller times out on its own request budget;
                     // put the panicking window on the wedge cooldown so dumps for
@@ -1856,13 +1921,17 @@ fn monitor_loop(rx: Receiver<Job>) {
                         *slot = None;
                     }
                     mark_wedged(job_hwnd);
+                } else if !superseded {
+                    // Only the owning generation may clear the current-job slot:
+                    // a superseded thread finishing a very late job must not
+                    // wipe the replacement monitor's in-flight bookkeeping.
+                    if let Ok(mut slot) = MONITOR_CURRENT.lock() {
+                        *slot = None;
+                    }
+                    clear_wedged(job_hwnd);
                 }
-                if let Ok(mut slot) = MONITOR_CURRENT.lock() {
-                    *slot = None;
-                }
-                clear_wedged(job_hwnd);
             }
-            Err(RecvTimeoutError::Timeout) => {
+            Some(Err(RecvTimeoutError::Timeout)) => {
                 let mut msg = MSG::default();
                 unsafe {
                     while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -1871,7 +1940,7 @@ fn monitor_loop(rx: Receiver<Job>) {
                     }
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+            Some(Err(RecvTimeoutError::Disconnected)) | None => break,
         }
     }
     unsafe { CoUninitialize() };
@@ -4154,6 +4223,18 @@ mod ax_tests {
         clear_wedged(hwnd);
         assert!(wedged_until(hwnd).is_none());
         *MONITOR_CURRENT.lock().unwrap() = None;
+    }
+
+    /// P1-2 root fix: each watchdog replacement advances the generation; a
+    /// monitor whose generation is superseded must stop serving.
+    #[test]
+    fn watchdog_replacement_advances_the_generation() {
+        let before = MONITOR_GEN.load(Ordering::SeqCst);
+        spawn_monitor();
+        let after = MONITOR_GEN.load(Ordering::SeqCst);
+        assert!(after > before, "generation must advance: {before} -> {after}");
+        // Without a shared receiver (unit-test process) the new monitor exits
+        // immediately instead of blocking; the generation still advanced.
     }
 
     /// AX-WEDGE: `job_hwnd` decides which window a timeout may blame, so every
