@@ -135,6 +135,30 @@ additionalProperties:true 全透传——模型在普通 click 调用里带 `"_l
 
 验证：Rust 232 pass（含新增代数推进测试）、Python 324 pass/4 skip；二进制以 c917741 重建（2769920B）。
 
+## 第 5 批 — 最小化恢复后 UIA provider 唤醒（2026-10-25）
+
+**现象**：v2rayN 7.25.6（Avalonia）最小化约 1 小时后，`activate_window` 正常恢复窗口，但随后
+两次 `get_window_state`（间隔 65s）都在 15s dump 等待上限处超时；第二次超时时监控上的陈旧
+dump job 已运行超过 `wedge_stuck_ms`（30s），把窗口打进 60s wedge 冷却。短最小化（10s/120s）不复现。
+
+**根因**：`activate_hwnd` 恢复最小化窗口只等 100ms 就返回，而长最小化后 Avalonia 的 UIA
+provider 处于休眠态，被动等待不会唤醒它；能唤醒它的是一次真实的 UIA 读取。
+
+**修复**：
+- `activate_hwnd` 的最小化恢复分支新增 `warm_up_uia_after_restore()`：在预算内（默认 12s，
+  `DSH_CU_AX_RESTORE_WARMUP_MS` 可调，`0` 禁用）以 250ms 间隔重试一次廉价的
+  `window_contains(hwnd, "")`（空 needle = dump 通道应答即成功）；失败中性——probe 自己挣来
+  的 wedge 冷却由 `clear_probe_cooldown()` 在循环结束时清除，真死的 provider 会在调用方的
+  下一次 dump 走正常路径重新挣冷却。
+- `uia.rs` 暴露 `clear_probe_cooldown()`（包装私有 `clear_wedged`）。
+- 完整性受限的窗口直接跳过 warm-up（读了也不会成功，不烧预算）。
+- 回归测试：`restore_warm_up_budget_parses_override_disable_and_garbage`。
+
+**构建注意**：沙箱内 MSVC link.exe 建临时文件偶发 LNK1104（9 试 8 败），改用 rust-lld
+（`CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` 指向 `~/.rustup/.../rust-lld.exe`）后稳定；
+常规控制台里 `scripts/ship-helper.ps1`（MSVC + 自动打 High 完整性标签）不受影响。
+本批二进制 2763776B（rust-lld，revision 1bbe4ad），尚待连同源码改动一起提交。
+
 ## 修复推进批次（建议顺序）
 
 **第 1 批（P1，约 2-3 天）— 止血正确性**

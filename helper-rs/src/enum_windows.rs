@@ -1178,6 +1178,54 @@ pub fn is_already_foreground(hwnd: HWND) -> bool {
     is_window(hwnd) && foreground_is_target(hwnd)
 }
 
+/// Bounded budget for the post-restore UIA warm-up; `0` disables it.
+const RESTORE_WARM_UP_BUDGET_MS: u64 = 12_000;
+/// Space between warm-up probe attempts.
+const RESTORE_WARM_UP_RETRY_MS: u64 = 250;
+
+/// `Some(ms)` for a well-formed override, `None` for absent or malformed.
+/// `Some(0)` is the operator's explicit disable and is honored, not defaulted.
+fn parse_warm_up_budget(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.parse().ok())
+}
+
+fn restore_warm_up_budget_ms() -> u64 {
+    parse_warm_up_budget(std::env::var("DSH_CU_AX_RESTORE_WARMUP_MS").ok().as_deref())
+        .unwrap_or(RESTORE_WARM_UP_BUDGET_MS)
+}
+
+/// A long-minimized window's UIA provider can stay silent long after the window
+/// itself is back on screen: v2rayN 7.x (Avalonia) minimized for ~1h answered
+/// two 15s dump waits 65s apart with `activate_window` long since returned, and
+/// the stale monitor job then wedged the window into a 60s cooldown. A real UIA
+/// read is exactly what wakes such a provider, so while the budget lasts, retry
+/// one cheap read (`window_contains` with an empty needle — any node answers) on
+/// the monitor machinery until it succeeds. Failures are ignored here: the
+/// caller's next dump reports a genuinely dead provider through the normal
+/// paths, and the cooldown the failed probes earned is dropped when the loop
+/// ends (`clear_probe_cooldown`).
+fn warm_up_uia_after_restore(hwnd: HWND) {
+    let budget_ms = restore_warm_up_budget_ms();
+    if budget_ms == 0 {
+        return; // the operator disabled the warm-up via DSH_CU_AX_RESTORE_WARMUP_MS
+    }
+    if crate::uia::integrity_blocked(hwnd.0 as isize).is_some() {
+        return; // reads cannot succeed here; do not spend the budget
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    let woke = loop {
+        if crate::uia::global().window_contains(hwnd.0 as isize, "").is_ok() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(RESTORE_WARM_UP_RETRY_MS));
+    };
+    crate::uia::clear_probe_cooldown(hwnd.0 as isize);
+    let _ = woke;
+}
+
 /// `HWND_TOPMOST` bump: raise the window above everything, then drop the TOPMOST
 /// flag so it stays a normal window. This is the documented way to beat a
 /// maximized sibling that visually covers the target: `SetForegroundWindow`
@@ -1232,6 +1280,7 @@ pub fn activate_hwnd(hwnd: HWND) -> Result<(), Error> {
         if is_minimized(hwnd) {
             post_restore(hwnd);
             std::thread::sleep(std::time::Duration::from_millis(100));
+            warm_up_uia_after_restore(hwnd);
         }
         // A hidden window can be made the foreground window while staying invisible, so
         // `SetForegroundWindow` alone reported success and the caller's retry still failed
@@ -1414,6 +1463,17 @@ pub fn extra_space_hwnds(hwnd: HWND, overlay: &[isize]) -> Vec<(isize, String)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_warm_up_budget_parses_override_disable_and_garbage() {
+        // Absent or malformed → the caller falls back to the built-in budget.
+        assert_eq!(parse_warm_up_budget(None), None);
+        assert_eq!(parse_warm_up_budget(Some("abc")), None);
+        assert_eq!(parse_warm_up_budget(Some("-5")), None);
+        assert_eq!(parse_warm_up_budget(Some("12000")), Some(12000));
+        // Some(0) is the operator's explicit disable, honored not defaulted.
+        assert_eq!(parse_warm_up_budget(Some("0")), Some(0));
+    }
 
     #[test]
     fn missing_id_lists_current_windows_with_official_window_debug() {

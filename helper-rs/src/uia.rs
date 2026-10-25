@@ -861,6 +861,16 @@ fn clear_wedged(hwnd: isize) {
     }
 }
 
+/// Operator-facing drop of a cooldown `hwnd` earned through failed probe jobs.
+/// The post-restore warm-up (`activate_hwnd` → `warm_up_uia_after_restore`)
+/// probes a possibly-dead provider, and every Err job result wedges its window;
+/// the warm-up clears what it earned when it ends, so a genuinely dead provider
+/// re-earns the cooldown through the caller's next dump instead of through the
+/// probe itself.
+pub fn clear_probe_cooldown(hwnd: isize) {
+    clear_wedged(hwnd);
+}
+
 fn env_ms(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
