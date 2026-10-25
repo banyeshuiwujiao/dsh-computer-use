@@ -18,6 +18,9 @@ $env:CARGO_ENCODED_RUSTFLAGS = (@(
   ('--remap-path-prefix=' + $root + '=<repo>'),
   ('--remap-path-prefix=' + $env:USERPROFILE + '=<home>')
 ) -join $unitSeparator)
+# Audit P3-2: bake the source revision into the binary so ci-smoke can fail a
+# stale committed exe (source changed, binary not rebuilt).
+$env:DSH_CU_BUILD_GIT = (git -C $root rev-parse --short HEAD)
 Push-Location (Join-Path $root 'helper-rs')
 cargo build --release
 cargo test --release

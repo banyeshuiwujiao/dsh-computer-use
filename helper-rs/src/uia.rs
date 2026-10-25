@@ -825,7 +825,19 @@ fn wedged_map() -> &'static Mutex<HashMap<isize, Instant>> {
 }
 
 fn wedged_until(hwnd: isize) -> Option<Instant> {
-    wedged_map().lock().ok().and_then(|guard| guard.get(&hwnd).copied())
+    // Audit P3-1 (2026-10-25): expired entries are removed on sight, not just
+    // ignored — a long batch session otherwise accumulates one dead hwnd per
+    // wedged window and diagnostics reports cooldownRemainingMs: 0 forever.
+    let now = Instant::now();
+    let mut guard = wedged_map().lock().ok()?;
+    match guard.get(&hwnd).copied() {
+        Some(until) if until > now => Some(until),
+        Some(_) => {
+            guard.remove(&hwnd);
+            None
+        }
+        None => None,
+    }
 }
 
 fn mark_wedged(hwnd: isize) {
@@ -871,7 +883,10 @@ pub fn wedge_diagnostics() -> serde_json::Value {
     let now = Instant::now();
     let wedged = wedged_map()
         .lock()
-        .map(|guard| {
+        .map(|mut guard| {
+            // Audit P3-1: prune dead entries here too — diagnostics must not
+            // report cooldownRemainingMs: 0 for windows that recovered long ago.
+            guard.retain(|_, until| *until > now);
             guard
                 .iter()
                 .map(|(hwnd, until)| {

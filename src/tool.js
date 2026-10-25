@@ -471,21 +471,18 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       }
       const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
       const startedAt = Date.now()
-      let result
-      try {
-        result = await ctx.dshComputerUse.call(spec.name, input, exec.signal, turnMeta)
-        if (result && result.approvalRequest) {
-          const refusal = normalizeApprovalRequest(result.approvalRequest)
-          // Official helper_transport.js only treats the payload as an approval when
-          // "app" is a non-empty string after trimming; otherwise the helper returned
-          // an ordinary error and this is not an approval flow (APS-10).
-          if (refusal) result = await resolveRefusal(ctx, config, state, spec, exec, input, turnMeta, refusal)
-        }
-        if (!result?.ok && result?.error) throw new Error(String(result.error))
-        result = deriveAudioResult(result, spec.name)
-      } catch (error) {
-        throw error
+      // Audit P3-3: the try/catch here used to rethrow unchanged — a dead
+      // remnant of the removed recordCall hook — so the bare try is gone too.
+      let result = await ctx.dshComputerUse.call(spec.name, input, exec.signal, turnMeta)
+      if (result && result.approvalRequest) {
+        const refusal = normalizeApprovalRequest(result.approvalRequest)
+        // Official helper_transport.js only treats the payload as an approval when
+        // "app" is a non-empty string after trimming; otherwise the helper returned
+        // an ordinary error and this is not an approval flow (APS-10).
+        if (refusal) result = await resolveRefusal(ctx, config, state, spec, exec, input, turnMeta, refusal)
       }
+      if (!result?.ok && result?.error) throw new Error(String(result.error))
+      result = deriveAudioResult(result, spec.name)
       const value = result?.value ?? result
       if (spec.name === 'get_window_state' && value?.accessibility?.tree) {
         state.lastElements = extractInteractiveElements(value.accessibility.tree)

@@ -856,9 +856,12 @@ test('OPT-1 the helper implements fill_form with replace semantics', () => {
   // The coordinate fallback must select-all + paste; a bare paste is the bug.
   assert.match(main, /input::replace_text_for\(/)
   assert.doesNotMatch(main, /input::paste_text\(&value\)\?/)
-  // UIA-level fallback too.
+  // Audit P2-4 (2026-10-25): the input fallback moved OFF the UIA monitor
+  // thread (synthetic typing there queued every other UIA request). The engine
+  // reports the miss; main.rs performs the replace on the caller's thread —
+  // so uia.rs must now contain NO input-injection calls at all.
   const uia = fs.readFileSync(path.join(pluginRoot, 'helper-rs', 'src', 'uia.rs'), 'utf8')
-  assert.match(uia, /crate::input::replace_text_for\(/)
+  assert.doesNotMatch(uia, /crate::input::/)
   assert.doesNotMatch(uia, /crate::input::paste_text\(value\)/)
 })
 

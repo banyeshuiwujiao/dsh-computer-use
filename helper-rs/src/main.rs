@@ -55,8 +55,25 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 static LAST_RPC: Mutex<Option<Instant>> = Mutex::new(None);
 static IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 
+/// Source revision this binary was built from ("unknown" for ad-hoc
+/// `cargo build` runs; scripts/ship-helper.ps1 injects the git hash).
+pub const BUILD_REVISION: &str = match option_env!("DSH_CU_BUILD_GIT") {
+    Some(rev) => rev,
+    None => "unknown",
+};
+
 fn main() {
     dpi::enable();
+    // Audit P3-2 (2026-10-25): the shipped binary embeds the source revision it
+    // was built from (set by scripts/ship-helper.ps1 via DSH_CU_BUILD_GIT). A
+    // stale committed exe — source changed, binary not rebuilt — is the single
+    // most common way these fixes silently regress, so CI compares this against
+    // git HEAD. Queried through the environment, not argv: the helper must keep
+    // the official CLI surface (unknown flags abort).
+    if std::env::var_os("DSH_CU_PRINT_BUILD").is_some() {
+        println!("{BUILD_REVISION}");
+        std::process::exit(0);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut parent_pid: u32 = 0;
     // FIX-4: the official helper has no clap, no --help and no subcommands. Exactly
@@ -514,6 +531,7 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                 "ok": true,
                 "overlay": "dsh",
                 "helper": "dsh-computer-use",
+                "revision": BUILD_REVISION,
                 "native": true,
                 "surface": st.surface,
                 "backend": st.backend,

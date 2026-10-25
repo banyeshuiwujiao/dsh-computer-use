@@ -117,6 +117,17 @@ additionalProperties:true 全透传——模型在普通 click 调用里带 `"_l
 
 验证：Python 324 过/4 跳过、JS 51 过/1 跳过、Rust 231 过；helper 二进制已重建发布（2753536B）。
 
+## 第 3 批（P3）进展 — 2026-10-25 完成
+
+- **P3-1 wedged 表清理** ✅：`wedged_until` 见到过期条目即删除，`wedge_diagnostics` 输出前 retain 过滤——不再累积死条目/报 cooldownRemainingMs:0。
+- **P3-2 二进制同步校验** ✅：helper 编译期嵌入 git 短哈希（`option_env!("DSH_CU_BUILD_GIT")`，ship-helper.ps1 注入），`health` 载荷携带 `revision`；`DSH_CU_PRINT_BUILD=1` 环境变量可直接打印（不动 argv，保住官方 CLI 契约）。ci-smoke.ps1 新增 `HelperBinaryRevision` 门禁：二进制哈希必须是 HEAD 的祖先（鸡生蛋问题：二进制不可能嵌包含它自己的提交），改源码忘重建会红。
+- **P3-3 tool.js 死代码** ✅：裸 try（recordCall 残壳）删除。注：初版编辑留下裸 try 导致语法错误并被 JS 测试当场抓住——契约测试的价值自证。
+- **P3-4 前台空轮询** ✅：6×50ms 收敛为 3×50ms（仅锁屏过渡期 NULL 前台会走到）。
+- **P3-5 set_value 防御分支** ✅：已随 P2-4 一并移除。
+- **P3-6 无问题确认项**：无需动作。
+
+验证：Python 324 pass/4 skip、JS 51 pass/1 skip、Rust 231 pass；二进制以 5ed0026 重建（2754048B）。
+
 ## 修复推进批次（建议顺序）
 
 **第 1 批（P1，约 2-3 天）— 止血正确性**

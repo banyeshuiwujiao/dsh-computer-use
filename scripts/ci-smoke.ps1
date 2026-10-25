@@ -46,6 +46,18 @@ if (Test-Path $helperBin) {
   $hasLow = $labelOut -match 'Low Mandatory Level'
   $intMsg = if ($hasLow) { "警告: helper.exe 带有 Low 完整性标签，先 icacls 去掉再重跑（fix-computer-use-integrity.ps1 已从仓库清出）" } else { "helper.exe 完整性正常 (High/Unlabeled)" }
   Record-Result "HelperIntegrity" (-not $hasLow) $intMsg
+  # Audit P3-2 (2026-10-25): the committed exe must be built from HEAD. A source
+  # change without a rebuilt binary silently regresses every helper fix.
+  $headRev = (git -C $PluginRoot rev-parse --short HEAD)
+  $env:DSH_CU_PRINT_BUILD = '1'
+  $binRev = (& $helperBin | Select-Object -First 1)
+  Remove-Item Env:\DSH_CU_PRINT_BUILD -ErrorAction SilentlyContinue
+  # The embedded rev can never equal the commit that carries the binary
+  # (chicken-and-egg), so the contract is: built from some commit that is an
+  # ANCESTOR of HEAD -- a stale binary from before the last source change fails.
+  git -C $PluginRoot merge-base --is-ancestor $binRev HEAD
+  $revOk = ($binRev -and $LASTEXITCODE -eq 0)
+  Record-Result "HelperBinaryRevision" $revOk "exe=$binRev head=$headRev（不一致请运行 scripts/ship-helper.ps1 重建并提交二进制）"
 } else {
   Record-Result "HelperBinary" $false "helper.exe 缺失，请先 cargo build --release"
 }

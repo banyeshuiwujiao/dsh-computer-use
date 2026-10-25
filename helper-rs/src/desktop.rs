@@ -95,7 +95,11 @@ fn name_is_lock_desktop(name: &str) -> bool {
 pub fn foreground_pid() -> u32 {
     let mut hwnd = unsafe { GetForegroundWindow() };
     if hwnd.0.is_null() {
-        for _ in 0..6 {
+        // Audit P3-4 (2026-10-25): a NULL foreground only happens during a lock
+        // / secure-desktop transition, and it does not clear in a meaningful way
+        // for ~150ms+ when it does. Three probes (150ms worst case, was 300ms)
+        // keep the lock detection without taxing every skip_lock_check caller.
+        for _ in 0..3 {
             std::thread::sleep(std::time::Duration::from_millis(50));
             hwnd = unsafe { GetForegroundWindow() };
             if !hwnd.0.is_null() {
