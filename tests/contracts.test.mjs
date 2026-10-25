@@ -735,6 +735,34 @@ test('list_apps gets a catalog-sized transport budget below the harness budget',
   assert.doesNotMatch(catalogSource, /prefer_product_name\(&shell\.display_name/)
 })
 
+test('get_window_state and type_text get their own budgets, and a timeout names the cold start', () => {
+  // AX-WEDGE: these two calls were the ones whose accessibility work outran the base
+  // budget on heavy Electron windows (QQNT main window, 2026-10-25), and every
+  // base-budget timeout KILLED the helper. The helper now answers within its budget
+  // (degraded tree, select-all-guarded retry), so the knobs only decide how long a
+  // healthy call may run; when the kill does happen, the error must name the cold
+  // start so the model reads a slower retry as the cost of the kill, not a second
+  // failure.
+  const HARNESS_TOOL_BUDGET_MS = 25000
+  const host = HostConfig({ windowStateTimeoutMs: 24000, typeTextTimeoutMs: 24000 })
+  assert.ok(host.windowStateTimeoutMs < HARNESS_TOOL_BUDGET_MS, 'below the harness tool budget')
+  assert.ok(host.typeTextTimeoutMs < HARNESS_TOOL_BUDGET_MS, 'below the harness tool budget')
+  const sidecar = new Sidecar(host)
+  assert.equal(sidecar.timeoutFor('call', { name: 'get_window_state' }), 24000, 'used verbatim')
+  assert.equal(sidecar.timeoutFor('call', { name: 'type_text' }), 24000, 'used verbatim')
+  // 0/absent falls back to the base budget (the helper answers degraded inside it now).
+  const base = new Sidecar(HostConfig({}))
+  assert.equal(base.timeoutFor('call', { name: 'get_window_state' }), base.config.timeoutMs)
+  assert.equal(base.timeoutFor('call', { name: 'type_text' }), base.config.timeoutMs)
+  // The kill-on-timeout error names the cold-start consequence, and the kill is
+  // counted for computer_use_health (a rising count points at the call class whose
+  // budget needs tuning).
+  const sidecarSource = source('sidecar.js')
+  assert.match(sidecarSource, /cold-starts the helper/)
+  assert.match(sidecarSource, /killedOnTimeout/)
+  assert.match(source('index.js'), /killStats\(\)/)
+})
+
 test('an aborted tool call cancels the action instead of latching the turn as user-stopped', () => {
   // The harness aborts a tool call when its own 25 s budget expires. The abort path used
   // to send the `interrupt` RPC, which latches the helper as stopped; every later call in

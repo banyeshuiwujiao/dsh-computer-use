@@ -123,6 +123,23 @@ export const Config = Schema.object({
    */
   listAppsTimeoutMs: Schema.number().default(20000),
   /**
+   * DSH extension: budget for `get_window_state`, the other request that can
+   * plausibly outrun the base budget on a heavy Electron/Chromium window (its
+   * accessibility dump walks hundreds of nodes through a UIA bridge that
+   * Chromium enables lazily). Same constraints as `listAppsTimeoutMs`: below
+   * DSH's 25 s tool budget, above the base when a caller means it. Since
+   * AX-WEDGE the helper degrades the tree instead of running past its budget,
+   * so this only decides how long a *healthy* dump may run. 0 falls back to
+   * `timeoutMs`.
+   */
+  windowStateTimeoutMs: Schema.number().default(0),
+  /**
+   * DSH extension: budget for `type_text`, whose landing-check ladder makes
+   * several accessibility reads per paste. Same constraints as
+   * `windowStateTimeoutMs`. 0 falls back to `timeoutMs`.
+   */
+  typeTextTimeoutMs: Schema.number().default(0),
+  /**
    * Helper startup budget in ms. Official `.mcp.json` uses
    * `startup_timeout_sec: 120`; a helper that never becomes ready must reject
    * rather than hang the session (MCP-05).
@@ -177,6 +194,8 @@ export default class ComputerUseService extends Service {
       timeoutMs: 10000,
       launchAppTimeoutMs: 15000,
       listAppsTimeoutMs: 20000,
+      windowStateTimeoutMs: 0,
+      typeTextTimeoutMs: 0,
       startupTimeoutMs: 15000,
       envAllowlist: [],
       preserveHelperOnTimeout: false,
@@ -278,6 +297,10 @@ export default class ComputerUseService extends Service {
       backend: this.config.backend,
       surface: this.config.surface,
       startupTimeoutMs: this.config.startupTimeoutMs,
+      // AX-WEDGE companion: how often each helper process was killed on its request
+      // budget. Every kill costs the next Computer Use call a cold start, so a
+      // rising number points at the call class whose budget needs tuning.
+      restarts: this.sidecar.killStats(),
       // MCP-02: the server-level instruction lives at a position that does not
       // grow with the tool catalog.
       serverInstructions: this.config.serverInstructions,

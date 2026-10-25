@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, Ref, BSTR, Result as WinResult};
 use windows_core::implement;
@@ -744,6 +744,234 @@ impl AccessibilityDump {
 
 pub type UiaResult<T> = Result<T, String>;
 
+// ---------------------------------------------------------------------------
+// AX-WEDGE: per-request deadlines and wedged-window cooldowns.
+//
+// Every client entry point used to block on `recv()` with no deadline, so one
+// provider that never answers (a Chromium UIA bridge on a busy renderer is the
+// measured case: QQNT's main window, 2026-10-25) wedged the single monitor
+// thread, and the only recovery was the Node transport killing the whole helper
+// process -- which also threw away the observation lease, the element cache and
+// Chromium's warmed accessibility tree. The walk's node/depth budgets bound how
+// MUCH is walked but nothing bounded HOW LONG one blocking COM call may take.
+// The transport budget now stays the outer backstop; the helper answers first.
+// ---------------------------------------------------------------------------
+
+/// Monotonic process clock for the absolute deadline slot (`Instant` itself does
+/// not fit an atomic), started on first use.
+static PROCESS_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+/// Deadline of the request currently being dispatched, in ms since
+/// [`PROCESS_CLOCK`]. `0` = no request budget (tests, non-request paths), in
+/// which case only the per-entry-point caps apply.
+static REQUEST_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The job the monitor thread is currently running: `(job hwnd, started)`,
+/// `hwnd = 0` for jobs that carry no window (focused-element reads, cached
+/// lookups, diagnostics). Published before the job runs so a client that times
+/// out can tell "my window's provider is wedged" from "the monitor is busy with
+/// an earlier job".
+static MONITOR_CURRENT: Mutex<Option<(isize, Instant)>> = Mutex::new(None);
+
+/// Windows whose UIA provider has proven wedged: hwnd -> cooldown end. Dumps for
+/// these windows short-circuit to the placeholder tree instead of queueing behind
+/// the stuck call that proved the wedge.
+static WEDGED: OnceLock<Mutex<HashMap<isize, Instant>>> = OnceLock::new();
+
+/// How long a window stays on the wedge list after one timed-out dump.
+const WEDGE_COOLDOWN_MS: u64 = 60_000;
+/// A job running this long is treated as wedged, not merely slow.
+const WEDGE_STUCK_MS: u64 = 30_000;
+/// Per-entry-point wait caps, so a request without a budget still cannot hang.
+const DUMP_WAIT_CAP_MS: u64 = 15_000;
+const MUTATE_WAIT_CAP_MS: u64 = 8_000;
+const READ_WAIT_CAP_MS: u64 = 3_000;
+
+fn process_clock() -> Instant {
+    *PROCESS_CLOCK.get_or_init(Instant::now)
+}
+
+/// Publish the budget of the request being dispatched. Called by the request
+/// dispatcher (`gate_and_dispatch`), which owns the request start and the
+/// transport's `x-oai-cua-request-budget-ms` header. `remaining_ms <= 0` clears
+/// the slot (no budget: only the caps apply).
+pub fn begin_request_budget(remaining_ms: i64) {
+    let deadline = if remaining_ms <= 0 {
+        0
+    } else {
+        process_clock().elapsed().as_millis() as u64 + remaining_ms as u64
+    };
+    REQUEST_DEADLINE_MS.store(deadline, Ordering::SeqCst);
+}
+
+/// How long the caller may wait for one reply: the request's remaining budget
+/// capped by the entry-point class. `Err` when the budget is already spent, so
+/// the caller fails with the protocol's budget message instead of a generic
+/// timeout.
+fn reply_wait(cap_ms: u64) -> Result<Duration, String> {
+    let deadline = REQUEST_DEADLINE_MS.load(Ordering::SeqCst);
+    if deadline == 0 {
+        return Ok(Duration::from_millis(cap_ms));
+    }
+    let now = process_clock().elapsed().as_millis() as u64;
+    if now >= deadline {
+        return Err(crate::protocol::BUDGET_EXHAUSTED.to_string());
+    }
+    Ok(Duration::from_millis(cap_ms.min(deadline - now)))
+}
+
+fn wedged_map() -> &'static Mutex<HashMap<isize, Instant>> {
+    WEDGED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wedged_until(hwnd: isize) -> Option<Instant> {
+    wedged_map().lock().ok().and_then(|guard| guard.get(&hwnd).copied())
+}
+
+fn mark_wedged(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    if let Ok(mut guard) = wedged_map().lock() {
+        guard.insert(hwnd, Instant::now() + Duration::from_millis(wedge_cooldown_ms()));
+    }
+}
+
+/// The monitor finished (or never started) a job for `hwnd`: drop its cooldown so
+/// the next dump for the window probes the provider again instead of serving the
+/// placeholder for the whole cooldown.
+fn clear_wedged(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    if let Ok(mut guard) = wedged_map().lock() {
+        guard.remove(&hwnd);
+    }
+}
+
+fn env_ms(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn wedge_cooldown_ms() -> u64 {
+    env_ms("DSH_CU_AX_WEDGE_COOLDOWN_MS", WEDGE_COOLDOWN_MS)
+}
+
+fn wedge_stuck_ms() -> u64 {
+    env_ms("DSH_CU_AX_WEDGE_STUCK_MS", WEDGE_STUCK_MS)
+}
+
+/// Operator-visible wedge state for `diagnostic_state`: which windows are on the
+/// cooldown list and what the monitor is currently running.
+pub fn wedge_diagnostics() -> serde_json::Value {
+    let now = Instant::now();
+    let wedged = wedged_map()
+        .lock()
+        .map(|guard| {
+            guard
+                .iter()
+                .map(|(hwnd, until)| {
+                    serde_json::json!({
+                        "hwnd": hwnd,
+                        "cooldownRemainingMs": until.saturating_duration_since(now).as_millis() as u64,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let current_job = MONITOR_CURRENT
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|(hwnd, started)| {
+            serde_json::json!({
+                "hwnd": hwnd,
+                "runningMs": started.elapsed().as_millis() as u64,
+            })
+        });
+    serde_json::json!({
+        "wedged": wedged,
+        "currentJob": current_job,
+    })
+}
+
+/// The error a caller gets when the monitor has been on one job for at least the
+/// caller's whole wait. `busy_hwnd == hwnd` means the caller's own job is the one
+/// in flight (its window may be wedged); anything else means the caller never got
+/// serviced and must not be blamed.
+fn monitor_busy_error(busy_hwnd: isize, elapsed_ms: u64, hwnd: isize, wait: Duration, what: &str) -> String {
+    if busy_hwnd != 0 && busy_hwnd == hwnd {
+        format!(
+            "{what} got no answer within {}ms (hwnd {hwnd}); its UIA provider looks wedged -- \
+             the window is on a {}ms cooldown and dumps for it fall back to a placeholder tree; \
+             use the screenshot and coordinate actions meanwhile",
+            wait.as_millis(),
+            wedge_cooldown_ms()
+        )
+    } else if busy_hwnd == 0 {
+        format!(
+            "accessibility monitor busy: a global accessibility job has been running for \
+             {elapsed_ms}ms; {what} was dropped without queueing"
+        )
+    } else {
+        format!(
+            "accessibility monitor busy: window {busy_hwnd}'s accessibility job has been running \
+             for {elapsed_ms}ms; {what} was dropped without queueing"
+        )
+    }
+}
+
+/// Fail fast when the monitor is already stuck (or slow beyond this caller's whole
+/// budget): queueing would only burn the wait and then time out anyway.
+fn precheck_monitor_busy(hwnd: isize, wait: Duration, what: &str) -> Result<(), String> {
+    let Some((busy_hwnd, started)) = MONITOR_CURRENT.lock().ok().and_then(|slot| *slot) else {
+        return Ok(());
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms < wait.as_millis() as u64 {
+        // The in-flight job may still finish inside this caller's budget.
+        return Ok(());
+    }
+    if elapsed_ms >= wedge_stuck_ms() {
+        mark_wedged(busy_hwnd);
+    }
+    Err(monitor_busy_error(busy_hwnd, elapsed_ms, hwnd, wait, what))
+}
+
+/// The verdict after a full wait: same attribution as [`precheck_monitor_busy`],
+/// but the in-flight job had the whole wait to finish and did not.
+fn timeout_verdict(hwnd: isize, wait: Duration, what: &str) -> String {
+    let Some((busy_hwnd, started)) = MONITOR_CURRENT.lock().ok().and_then(|slot| *slot) else {
+        return format!("{what} did not answer within {}ms", wait.as_millis());
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms >= wait.as_millis() as u64 {
+        if elapsed_ms >= wedge_stuck_ms() {
+            mark_wedged(busy_hwnd);
+        }
+        return monitor_busy_error(busy_hwnd, elapsed_ms, hwnd, wait, what);
+    }
+    format!("{what} did not answer within {}ms", wait.as_millis())
+}
+
+/// One bounded wait for a monitor reply, shared by every client entry point.
+///
+/// `hwnd` is the window the job targets (0 for global jobs). `what` names the
+/// operation in the model-visible error.
+fn wait_reply<T>(rx: Receiver<UiaResult<T>>, hwnd: isize, cap_ms: u64, what: &str) -> UiaResult<T> {
+    let wait = reply_wait(cap_ms)?;
+    precheck_monitor_busy(hwnd, wait, what)?;
+    match rx.recv_timeout(wait) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Disconnected) => Err(MONITOR_DID_NOT_START.to_string()),
+        Err(RecvTimeoutError::Timeout) => Err(timeout_verdict(hwnd, wait, what)),
+    }
+}
+
 enum Job {
     Dump {
         hwnd: isize,
@@ -865,31 +1093,28 @@ impl UiaClient {
 
     pub fn dump(&self, hwnd: isize, title: &str, origin: (f64, f64), scale: f64) -> UiaResult<AccessibilityDump> {
         if let Some(msg) = integrity_blocked(hwnd) {
-            let bounds = window_logical_bounds(hwnd, origin, scale);
-            let node = UiNode {
-                index: 0,
-                role: "window".into(),
-                name: msg,
-                bounds,
-                value: String::new(),
-                depth: 0,
-                actions: Vec::new(),
-                automation_id: String::new(),
-                description: String::new(),
-                states: Vec::new(),
-                focused: true,
-                runtime_id: Vec::new(),
-                truncated: None,
-            };
-            let focused = focused_line(&node);
-            return Ok(AccessibilityDump {
-                focused,
-                nodes: vec![node],
-                ..AccessibilityDump::default()
-            });
+            return Ok(single_node_dump(hwnd, title, origin, scale, msg));
         }
         if hwnd == 0 {
             return Ok(fallback_dump(hwnd, title, origin, scale));
+        }
+        // AX-WEDGE: a window whose UIA provider wedged recently serves the
+        // placeholder tree immediately instead of queueing behind the stuck call
+        // that proved the wedge. The cooldown ends early when the stuck call
+        // finally completes (the monitor clears the entry), or expires so the
+        // provider is probed again.
+        if wedged_until(hwnd).is_some_and(|until| until > Instant::now()) {
+            return Ok(single_node_dump(
+                hwnd,
+                title,
+                origin,
+                scale,
+                format!(
+                    "accessibility is temporarily unavailable for this window ({}ms cooldown after a \
+                     wedged UIA dump); use the screenshot and coordinate actions",
+                    wedge_cooldown_ms()
+                ),
+            ));
         }
         wait_window_opened_ready()?;
         let (resp_tx, resp_rx) = mpsc::channel();
@@ -902,7 +1127,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| MONITOR_DID_NOT_START.to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility dump timeout".to_string())?
+        wait_reply(resp_rx, hwnd, DUMP_WAIT_CAP_MS, "accessibility dump")
     }
 
     pub fn set_value(&self, hwnd: isize, index: i32, value: &str) -> UiaResult<()> {
@@ -916,7 +1141,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send set value request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility set value".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility set value")
     }
 
     pub fn focused_value(&self) -> UiaResult<Option<String>> {
@@ -925,7 +1150,7 @@ impl UiaClient {
         self.tx
             .send(Job::FocusedValue { resp: resp_tx })
             .map_err(|_| "send focused value request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility focused value".to_string())?
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility focused value")
     }
 
     /// Best-effort focused-control value: `None` when there is no focused element or
@@ -947,7 +1172,7 @@ impl UiaClient {
         wait_window_opened_ready().ok()?;
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx.send(Job::FocusedText { resp: resp_tx }).ok()?;
-        resp_rx.recv().ok()?.ok().flatten()
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility focused text").ok()?
     }
 
     /// The focused element's text range (TextPattern), if it is a usable witness.
@@ -968,7 +1193,13 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .ok()?;
-        resp_rx.recv().ok()?.ok().flatten()
+        wait_reply(
+            resp_rx,
+            window_hwnd,
+            READ_WAIT_CAP_MS,
+            "accessibility focused text range",
+        )
+        .ok()?
     }
 
     /// Whether the focused element is a whole-window container (a page/document
@@ -983,7 +1214,13 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .ok()?;
-        resp_rx.recv().ok()?.ok()
+        wait_reply(
+            resp_rx,
+            window_hwnd,
+            READ_WAIT_CAP_MS,
+            "accessibility focused container check",
+        )
+        .ok()
     }
 
     /// Whether the focused control accepts typed text.
@@ -1003,7 +1240,13 @@ impl UiaClient {
         wait_window_opened_ready().ok()?;
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx.send(Job::FocusedEditability { resp: resp_tx }).ok()?;
-        resp_rx.recv().ok()?.ok().flatten()
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility focused editability",
+        )
+        .ok()?
     }
 
     /// The window id (HWND) that currently owns keyboard focus, if it can be read.
@@ -1011,7 +1254,7 @@ impl UiaClient {
         wait_window_opened_ready().ok()?;
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx.send(Job::FocusedWindowId { resp: resp_tx }).ok()?;
-        resp_rx.recv().ok()?.ok().flatten()
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility focused window id").ok()?
     }
 
     /// One dump answering both landing questions: does any node contain `needle`,
@@ -1053,7 +1296,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send window contains request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility window contains".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility window contains")
     }
 
     pub fn secondary(&self, hwnd: isize, index: i32, action: &str) -> UiaResult<()> {
@@ -1067,7 +1310,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send secondary action request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility secondary action".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility secondary action")
     }
 
     pub fn select_text(&self, hwnd: isize, index: i32, text: &str) -> UiaResult<()> {
@@ -1081,7 +1324,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send select text request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility select text".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility select text")
     }
 
     pub fn scroll(&self, hwnd: isize, index: i32, direction: &str, pages: i32) -> UiaResult<()> {
@@ -1096,7 +1339,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send element target request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility element target".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility scroll")
     }
 
     pub fn cached_bounds(&self, index: i32) -> UiaResult<Bounds> {
@@ -1104,7 +1347,12 @@ impl UiaClient {
         self.tx
             .send(Job::CachedBounds { index, resp: resp_tx })
             .map_err(|_| format!("element {index} {NO_CACHED_BOUNDS}"))?;
-        resp_rx.recv().map_err(|_| format!("element {index} {NO_CACHED_BOUNDS}"))?
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility cached bounds lookup",
+        )
     }
 
     pub fn cached_actions(&self, index: i32) -> UiaResult<Vec<String>> {
@@ -1112,7 +1360,12 @@ impl UiaClient {
         self.tx
             .send(Job::CachedActions { index, resp: resp_tx })
             .map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?;
-        resp_rx.recv().map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility cached actions lookup",
+        )
     }
 
     /// What an observed element currently shows, for a read-back after a write:
@@ -1127,7 +1380,7 @@ impl UiaClient {
     pub fn value_at(&self, hwnd: isize, index: i32) -> Option<String> {
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx.send(Job::ValueAt { hwnd, index, resp: resp_tx }).ok()?;
-        resp_rx.recv().ok()?.ok()?
+        wait_reply(resp_rx, hwnd, READ_WAIT_CAP_MS, "accessibility value read-back").ok()?
     }
 
     /// The UIA runtime id of a node observed by the latest walk.
@@ -1142,7 +1395,12 @@ impl UiaClient {
         self.tx
             .send(Job::RuntimeId { index, resp: resp_tx })
             .map_err(|_| format!("element {index} {RUNTIME_ID_MISMATCH}"))?;
-        resp_rx.recv().map_err(|_| format!("element {index} {RUNTIME_ID_MISMATCH}"))?
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility runtime id lookup",
+        )
     }
 
     /// The index that currently names `runtime_id`, or `None` when the control
@@ -1155,7 +1413,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "uia engine is not running".to_string())?;
-        resp_rx.recv().map_err(|_| "uia engine is not running".to_string())?
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility index lookup")
     }
 
     pub fn diagnostics(&self) -> serde_json::Value {
@@ -1163,7 +1421,13 @@ impl UiaClient {
         if wait_window_opened_ready().is_err() || self.tx.send(Job::Diagnostics { resp: resp_tx }).is_err() {
             return diagnostics_payload(None);
         }
-        resp_rx.recv().unwrap_or_else(|_| diagnostics_payload(None))
+        // Health must answer even when the monitor is wedged, so this entry
+        // degrades to the empty payload instead of propagating the timeout.
+        let wait = reply_wait(READ_WAIT_CAP_MS).unwrap_or(Duration::from_millis(1));
+        match resp_rx.recv_timeout(wait) {
+            Ok(payload) => payload,
+            Err(_) => diagnostics_payload(None),
+        }
     }
 }
 
@@ -1272,6 +1536,33 @@ impl Engine {
     }
 }
 
+/// The window a job targets, for the AX-WEDGE current-job slot. `0` for jobs that
+/// carry no window (focused-element reads, cached lookups, diagnostics) -- a
+/// timeout on those can be attributed to the monitor being busy, never to a
+/// specific window's provider.
+fn job_hwnd(job: &Job) -> isize {
+    match job {
+        Job::Dump { hwnd, .. }
+        | Job::SetValue { hwnd, .. }
+        | Job::Secondary { hwnd, .. }
+        | Job::SelectText { hwnd, .. }
+        | Job::Scroll { hwnd, .. }
+        | Job::ValueAt { hwnd, .. }
+        | Job::WindowContains { hwnd, .. } => *hwnd,
+        Job::FocusedTextRange { window_hwnd, .. }
+        | Job::FocusedContainer { window_hwnd, .. } => *window_hwnd,
+        Job::CachedBounds { .. }
+        | Job::CachedActions { .. }
+        | Job::RuntimeId { .. }
+        | Job::IndexOf { .. }
+        | Job::Diagnostics { .. }
+        | Job::FocusedValue { .. }
+        | Job::FocusedText { .. }
+        | Job::FocusedEditability { .. }
+        | Job::FocusedWindowId { .. } => 0,
+    }
+}
+
 fn monitor_loop(rx: Receiver<Job>) {
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr.is_err() && hr != RPC_E_CHANGED_MODE {
@@ -1299,7 +1590,17 @@ fn monitor_loop(rx: Receiver<Job>) {
     };
     loop {
         match rx.recv_timeout(Duration::from_millis(40)) {
-            Ok(job) => match job {
+            Ok(job) => {
+                // AX-WEDGE: publish what the monitor is working on so a client that
+                // times out can attribute the stall, and clear the window's wedge
+                // entry when the job finishes (a stuck provider that eventually
+                // answers recovers immediately instead of serving the placeholder
+                // for the rest of its cooldown).
+                let job_hwnd = job_hwnd(&job);
+                if let Ok(mut slot) = MONITOR_CURRENT.lock() {
+                    *slot = Some((job_hwnd, Instant::now()));
+                }
+                match job {
             Job::Dump {
                 hwnd,
                 title,
@@ -1526,7 +1827,12 @@ fn monitor_loop(rx: Receiver<Job>) {
                 };
                 let _ = resp.send(result);
             }
-            },
+                };
+                if let Ok(mut slot) = MONITOR_CURRENT.lock() {
+                    *slot = None;
+                }
+                clear_wedged(job_hwnd);
+            }
             Err(RecvTimeoutError::Timeout) => {
                 let mut msg = MSG::default();
                 unsafe {
@@ -3082,6 +3388,38 @@ fn window_logical_bounds(hwnd: isize, origin: (f64, f64), scale: f64) -> Bounds 
     logical_bounds(rect, origin, scale)
 }
 
+/// The one-node placeholder tree: the official integrity gate and the AX-WEDGE
+/// cooldown path both serve this shape, with the reason as the root node's name.
+fn single_node_dump(
+    hwnd: isize,
+    _title: &str,
+    origin: (f64, f64),
+    scale: f64,
+    message: String,
+) -> AccessibilityDump {
+    let node = UiNode {
+        index: 0,
+        role: "window".into(),
+        name: message,
+        bounds: window_logical_bounds(hwnd, origin, scale),
+        value: String::new(),
+        depth: 0,
+        actions: Vec::new(),
+        automation_id: String::new(),
+        description: String::new(),
+        states: Vec::new(),
+        focused: true,
+        runtime_id: Vec::new(),
+        truncated: None,
+    };
+    let focused = focused_line(&node);
+    AccessibilityDump {
+        focused,
+        nodes: vec![node],
+        ..AccessibilityDump::default()
+    }
+}
+
 fn fallback_dump(hwnd: isize, title: &str, origin: (f64, f64), scale: f64) -> AccessibilityDump {
     let node = UiNode {
         index: 0,
@@ -3714,6 +4052,124 @@ mod ax_tests {
             WalkLimits { child_limit: 7, document_child_limit: 9, ..rich }.child_cap_for("list"),
             7
         );
+    }
+
+    /// AX-WEDGE: the reply wait is bounded by the request budget and the
+    /// entry-point cap. One test, not three: the deadline slot is process-global
+    /// and parallel tests would clobber each other's budget mid-assertion.
+    #[test]
+    fn reply_wait_honors_the_request_budget_and_the_caps() {
+        // No budget: the cap is the whole wait.
+        begin_request_budget(0);
+        assert_eq!(
+            reply_wait(READ_WAIT_CAP_MS),
+            Ok(Duration::from_millis(READ_WAIT_CAP_MS))
+        );
+        assert_eq!(
+            reply_wait(DUMP_WAIT_CAP_MS),
+            Ok(Duration::from_millis(DUMP_WAIT_CAP_MS))
+        );
+        // A live budget clamps the wait to the remaining time.
+        begin_request_budget(1_500);
+        let wait = reply_wait(DUMP_WAIT_CAP_MS).expect("budget is live");
+        assert!(wait <= Duration::from_millis(1_500), "wait {wait:?} exceeds the budget");
+        assert!(wait >= Duration::from_millis(1_400), "wait {wait:?} lost the budget");
+        // A spent budget fails with the protocol's budget message, never with a
+        // generic "did not answer" that would blame the monitor.
+        begin_request_budget(30);
+        std::thread::sleep(Duration::from_millis(60));
+        let err = reply_wait(READ_WAIT_CAP_MS).unwrap_err();
+        assert_eq!(err, crate::protocol::BUDGET_EXHAUSTED);
+        begin_request_budget(0);
+    }
+
+    /// AX-WEDGE: a monitor job that has outlived the caller's whole wait reports the
+    /// in-flight job as busy (and wedges its window once it is stuck for real),
+    /// instead of letting every caller queue behind it and time out in turn.
+    #[test]
+    fn a_stuck_monitor_job_reports_busy_and_wedges_its_window() {
+        let stuck_hwnd: isize = 0x51DE_0001;
+        let caller_hwnd: isize = 0x51DE_0002;
+        *MONITOR_CURRENT.lock().unwrap() = Some((stuck_hwnd, Instant::now() - Duration::from_millis(40_000)));
+        let err = precheck_monitor_busy(caller_hwnd, Duration::from_millis(100), "accessibility dump")
+            .unwrap_err();
+        assert!(err.contains("monitor busy"), "{err}");
+        assert!(err.contains(&stuck_hwnd.to_string()), "{err}");
+        assert!(
+            wedged_until(stuck_hwnd).is_some(),
+            "a 40s job is past the stuck threshold and must wedge its window"
+        );
+        assert!(wedged_until(caller_hwnd).is_none(), "the caller's window is not to blame");
+        *MONITOR_CURRENT.lock().unwrap() = None;
+        clear_wedged(stuck_hwnd);
+        assert!(wedged_until(stuck_hwnd).is_none());
+    }
+
+    /// AX-WEDGE: when the caller's OWN dump is the job the monitor is stuck on, the
+    /// error names the wedge and the cooldown instead of a generic timeout.
+    #[test]
+    fn a_timeout_on_our_own_wedged_dump_names_the_cooldown() {
+        let hwnd: isize = 0x51DE_0003;
+        *MONITOR_CURRENT.lock().unwrap() = Some((hwnd, Instant::now() - Duration::from_millis(40_000)));
+        let err = timeout_verdict(hwnd, Duration::from_millis(100), "accessibility dump");
+        assert!(err.contains("wedged"), "{err}");
+        assert!(err.contains("cooldown"), "{err}");
+        assert!(wedged_until(hwnd).is_some(), "the wedged window must be on the cooldown list");
+        *MONITOR_CURRENT.lock().unwrap() = None;
+        clear_wedged(hwnd);
+    }
+
+    /// AX-WEDGE: a young in-flight job does not trip the busy path, and a job that
+    /// finishes clears its window's cooldown entry (recovery before the cooldown
+    /// expires).
+    #[test]
+    fn a_young_or_finished_job_never_wedges() {
+        let hwnd: isize = 0x51DE_0004;
+        mark_wedged(hwnd);
+        assert!(wedged_until(hwnd).is_some());
+        *MONITOR_CURRENT.lock().unwrap() = Some((hwnd, Instant::now()));
+        precheck_monitor_busy(hwnd, Duration::from_millis(5_000), "accessibility dump")
+            .expect("a just-started job must not fail the caller");
+        // The monitor finishing the job clears the wedge even mid-cooldown.
+        clear_wedged(hwnd);
+        assert!(wedged_until(hwnd).is_none());
+        *MONITOR_CURRENT.lock().unwrap() = None;
+    }
+
+    /// AX-WEDGE: `job_hwnd` decides which window a timeout may blame, so every
+    /// hwnd-carrying variant must map to its window and every global job to 0.
+    #[test]
+    fn job_hwnd_maps_every_variant() {
+        let (t_unit, _r_unit) = mpsc::channel::<UiaResult<()>>();
+        let (t_dump, _r_dump) = mpsc::channel::<UiaResult<AccessibilityDump>>();
+        let (t_bool, _r_bool) = mpsc::channel::<UiaResult<bool>>();
+        let (t_bounds, _r_bounds) = mpsc::channel::<UiaResult<Bounds>>();
+        let (t_actions, _r_actions) = mpsc::channel::<UiaResult<Vec<String>>>();
+        let (t_rid, _r_rid) = mpsc::channel::<UiaResult<Vec<i32>>>();
+        let (t_index, _r_index) = mpsc::channel::<UiaResult<Option<i32>>>();
+        let (t_opt_string, _r_opt_string) = mpsc::channel::<UiaResult<Option<String>>>();
+        let (t_opt_bool, _r_opt_bool) = mpsc::channel::<UiaResult<Option<bool>>>();
+        let (t_opt_hwnd, _r_opt_hwnd) = mpsc::channel::<UiaResult<Option<isize>>>();
+        let (t_diag, _r_diag) = mpsc::channel::<serde_json::Value>();
+        assert_eq!(job_hwnd(&Job::Dump { hwnd: 5, title: String::new(), origin: (0.0, 0.0), scale: 1.0, resp: t_dump.clone() }), 5);
+        assert_eq!(job_hwnd(&Job::SetValue { hwnd: 6, index: 0, value: String::new(), resp: t_unit.clone() }), 6);
+        assert_eq!(job_hwnd(&Job::Secondary { hwnd: 7, index: 0, action: String::new(), resp: t_unit.clone() }), 7);
+        assert_eq!(job_hwnd(&Job::SelectText { hwnd: 8, index: 0, text: String::new(), resp: t_unit.clone() }), 8);
+        assert_eq!(job_hwnd(&Job::Scroll { hwnd: 9, index: 0, direction: String::new(), pages: 0, resp: t_unit.clone() }), 9);
+        assert_eq!(job_hwnd(&Job::ValueAt { hwnd: 10, index: 0, resp: t_opt_string.clone() }), 10);
+        assert_eq!(job_hwnd(&Job::WindowContains { hwnd: 11, needle: String::new(), resp: t_bool.clone() }), 11);
+        assert_eq!(job_hwnd(&Job::FocusedTextRange { window_hwnd: 12, resp: t_opt_string.clone() }), 12);
+        assert_eq!(job_hwnd(&Job::FocusedContainer { window_hwnd: 13, resp: t_bool }), 13);
+        assert_eq!(job_hwnd(&Job::CachedBounds { index: 0, resp: t_bounds.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::CachedActions { index: 0, resp: t_actions.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::RuntimeId { index: 0, resp: t_rid.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::IndexOf { runtime_id: vec![], resp: t_index.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::Diagnostics { resp: t_diag }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedValue { resp: t_opt_string.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedText { resp: t_opt_string }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedEditability { resp: t_opt_bool }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedWindowId { resp: t_opt_hwnd }), 0);
+        drop(t_unit);
     }
 
     /// AX-16: the diagnostic payload carries every field name the official ships

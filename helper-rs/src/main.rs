@@ -434,6 +434,14 @@ fn gate_and_dispatch(
     budget_ms: i64,
 ) -> Result<Value, Error> {
     budget_check(started, budget_ms)?;
+    // AX-WEDGE: publish this request's remaining budget so the accessibility client
+    // bounds every blocking call by it and answers BEFORE the transport kills the
+    // helper. The transport budget stays the outer backstop, not the primary bound.
+    uia::begin_request_budget(if budget_ms > 0 {
+        budget_ms - started.elapsed().as_millis() as i64
+    } else {
+        0
+    });
     // The turn-lifecycle method must stay reachable while the turn is stopped: `end_turn` is
     // the only path that clears the STOPPED latch and deletes the interrupt marker, so routing
     // it through those very checks made the cleanup unreachable exactly when it was needed
@@ -711,13 +719,13 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             if text.is_empty() {
                 return Ok(json!({}));
             }
-            // F2: `type_text` is a clipboard paste (Ctrl+V). Verify target-scoped:
-            // dump the target window and check the text actually landed, regardless
-            // of where focus is (robust to the overlay / foreground-lock no-op). The
-            // focused control's value is a secondary signal for controls whose text
-            // is not in the window dump. Every check goes through
+            // F2: `type_text` is a clipboard paste (Ctrl+V). Verify target-scoped, on
+            // the focused control only -- never a window-wide search, which a chat
+            // app that echoes the tool call into its transcript would trivially
+            // "confirm" (the 2026-10-22 false positive), and which costs a full tree
+            // walk on a browser window. Every check goes through
             // `text_landed_settling` (one immediate pass, one after 300ms) and
-            // returns a three-state verdict.
+            // returns a four-state verdict.
             //
             // Only a *proven* absence fails. A surface that publishes no text at all
             // (Chromium contenteditable, canvas editors) can never witness the paste,
@@ -733,6 +741,19 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             let mut last = text_landed_settling(wid, &text, &before_fv);
             if last.failed(wid) {
                 let _ = activate_hwnd(hwnd);
+                // AX-WEDGE anti-doubling: the retry must REPLACE, not append. A
+                // stale/uncommitted read-back (a slow Chromium field that still shows
+                // the pre-paste value, 2026-10-25 QQNT search box) reads as "did not
+                // land", and a second plain Ctrl+V pasted the text a second time at
+                // the cursor. When the focus is a text target inside this window,
+                // select-all first so the retry overwrites whatever did or did not
+                // land; with no editable focus, Ctrl+A could select an arbitrary
+                // surface and the paste would overwrite it, so the retry stays a
+                // plain insert there.
+                if focused_accepts_text(wid) {
+                    let _ = input::press_key_for(Some(wid), "Control_L+a");
+                    thread::sleep(Duration::from_millis(50));
+                }
                 interrupt::mark_synthetic(0.3);
                 input::paste_text_for(Some(wid), &text)?;
                 last = text_landed_settling(wid, &text, &before_fv);
@@ -740,7 +761,12 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                     // Last resort: post WM_PASTE straight to the focused control of
                     // the target's GUI thread. This bypasses SendInput and helps the
                     // classic Win32 EDIT case; it does not apply to WinUI/XAML and
-                    // cannot cross a UIPI integrity boundary.
+                    // cannot cross a UIPI integrity boundary. Same select-all guard
+                    // as above: the retry must replace, never append.
+                    if focused_accepts_text(wid) {
+                        let _ = input::press_key_for(Some(wid), "Control_L+a");
+                        thread::sleep(Duration::from_millis(50));
+                    }
                     let _ = input::paste_text_via_postmessage(wid, &text);
                     last = text_landed_settling(wid, &text, &before_fv);
                     if last.failed(wid) {
@@ -941,6 +967,20 @@ fn landing_from(signals: &LandingSignals, text: &str) -> Option<Landing> {
     if let Some(current) = &signals.range_text {
         if current.contains(text) {
             return Some(Landing::Landed);
+        }
+    }
+    // 3.5. The focused value is byte-identical to the pre-paste value. On a slow
+    // Chromium field the paste commits asynchronously and the read-back still
+    // shows the pre-paste state, so "unchanged" is what a STALE read looks like
+    // -- it is not proof the paste failed (2026-10-25, QQNT search box: the
+    // paste landed, the first read returned the pre-paste empty value, the old
+    // code called it Absent, the retry appended a second copy, and the doubled
+    // text is something the caller cannot undo). An unchanged read-back that no
+    // positive signal witnessed is honestly "cannot tell"; the caller reports
+    // success when the focus is editable and re-observes otherwise.
+    if let (Some(before), Some(after)) = (&signals.before_value, &signals.after_value) {
+        if before == after {
+            return Some(Landing::Unverifiable);
         }
     }
     // 4. The focused control publishes no text whatsoever -> the surface keeps
@@ -1147,21 +1187,34 @@ fn get_window_state(state: &Mutex<HelperState>, params: &Map<String, Value>) -> 
     let mut nodes = Vec::new();
     let mut full_tree = String::new();
     if include_text {
-        let dumped = uia::global()
-            .dump(window.id as isize, &window.title, origin, scale)
-            .map_err(Error::desktop)?;
-        full_tree = uia::format_accessibility(&dumped, &window.title, &window.app);
-        nodes = dumped.nodes.clone();
-        // TC-03/AX-04: the official `accessibility.tree` always carries the FULL
-        // formatted tree, and `WindowState.d.ts` has no `diff` field. DSH used to
-        // substitute an accessibility diff for the tree and emit a non-official `diff`
-        // boolean, which made the field mean something other than the official schema.
-        //
-        // AX-05/AX-07: `uia::AccessibilityDump::to_json` applies the official
-        // serialisation rules (absent optional fields are omitted, and the official
-        // `meta` keys appear only when the tree was actually truncated).
-        let _ = disable_diffing;
-        accessibility = dumped.to_json(&full_tree);
+        // AX-WEDGE degraded observation: the screenshot is already captured, so a
+        // dump that cannot answer (a wedged UIA provider, a spent budget) must not
+        // fail the request -- that used to cost the whole helper process at the
+        // transport budget, and with it the coordinate path this observation feeds.
+        // The error travels in `accessibility` instead; the model keeps the screenshot
+        // and coordinate actions while the element list is empty.
+        match uia::global().dump(window.id as isize, &window.title, origin, scale) {
+            Ok(dumped) => {
+                full_tree = uia::format_accessibility(&dumped, &window.title, &window.app);
+                nodes = dumped.nodes.clone();
+                // TC-03/AX-04: the official `accessibility.tree` always carries the FULL
+                // formatted tree, and `WindowState.d.ts` has no `diff` field. DSH used to
+                // substitute an accessibility diff for the tree and emit a non-official `diff`
+                // boolean, which made the field mean something other than the official schema.
+                //
+                // AX-05/AX-07: `uia::AccessibilityDump::to_json` applies the official
+                // serialisation rules (absent optional fields are omitted, and the official
+                // `meta` keys appear only when the tree was actually truncated).
+                let _ = disable_diffing;
+                accessibility = dumped.to_json(&full_tree);
+            }
+            Err(err) => {
+                accessibility = serde_json::json!({
+                    "tree": String::new(),
+                    "error": err,
+                });
+            }
+        }
     }
     let mut screenshots = Vec::new();
     let mut st = state.lock().map_err(|_| Error::other("state lock"))?;
@@ -1380,6 +1433,7 @@ fn diagnostic_state(state: &Mutex<HelperState>) -> Result<Value, Error> {
         // Catalog timing: the one Computer Use method that can run for seconds on a cold
         // machine, and the one the transport's 10 s budget turns into a helper restart.
         body["appCatalog"] = app_catalog::catalog_diagnostics();
+        body["uiaWedge"] = uia::wedge_diagnostics();
         body["computerUseEnabled"] = json!(policy::computer_use_enabled());
         body["overlayState"] = overlay::diagnostics();
         body["captureState"] = capture::capture_diagnostics();
@@ -2282,7 +2336,13 @@ mod tests {
             after_value: Some("old".into()),
             ..Default::default()
         };
-        assert_eq!(landing_from(&unchanged, "hello"), Some(Landing::Absent));
+        // AX-WEDGE anti-doubling (2026-10-25): an unchanged read-back is exactly what
+        // a stale Chromium read looks like, so it is "cannot tell" now, NOT a proven
+        // absence -- the old Absent verdict re-pasted and doubled the text in the
+        // QQNT search box. A genuinely missed paste is caught by the caller's own
+        // read-back instead (the false success costs a re-observe; the false failure
+        // cost corrupted field content).
+        assert_eq!(landing_from(&unchanged, "hello"), Some(Landing::Unverifiable));
 
         let changed = LandingSignals {
             node_text: Some("x".into()),
@@ -2410,6 +2470,62 @@ mod tests {
         assert!(Landing::Absent.failed_with(true));
         // Proven landing never fails, whatever the focus looks like.
         assert!(!Landing::Landed.failed_with(false));
+    }
+
+    /// AX-WEDGE anti-doubling (2026-10-25): a slow Chromium field commits the paste
+    /// asynchronously, so the read-back can still carry the PRE-paste value. A
+    /// readable-but-unchanged read-back that no positive signal witnessed used to
+    /// fall through to `Absent` ("proven absence"), which re-pasted and doubled the
+    /// text in the QQNT search box. Unchanged is "cannot tell", not "proven
+    /// absence"; a read-back that DID change still decides exactly as before.
+    #[test]
+    fn a_stale_unchanged_read_back_is_not_a_proven_absence() {
+        // The QQNT search box case: empty before, stale empty after.
+        let stale = LandingSignals {
+            node_text: Some(String::new()),
+            range_text: None,
+            before_value: Some(String::new()),
+            after_value: Some(String::new()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&stale, "1018595918"), Some(Landing::Unverifiable));
+        // Non-empty stale value: same verdict.
+        let stale = LandingSignals {
+            node_text: Some("old note".to_string()),
+            range_text: None,
+            before_value: Some("old note".to_string()),
+            after_value: Some("old note".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&stale, "1018595918"), Some(Landing::Unverifiable));
+        // A read-back that DID change still decides, unchanged behavior:
+        // carrying the text is Landed, carrying something else is Wrong.
+        let landed = LandingSignals {
+            node_text: Some(String::new()),
+            range_text: None,
+            before_value: Some(String::new()),
+            after_value: Some("1018595918".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&landed, "1018595918"), Some(Landing::Landed));
+        let wrong = LandingSignals {
+            node_text: Some("v".to_string()),
+            range_text: None,
+            before_value: Some(String::new()),
+            after_value: Some("v".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&wrong, "1018595918"), Some(Landing::Wrong));
+        // before=None (unreadable before) with a readable non-carrying after stays
+        // Absent: the value DID change, so the read is not stale.
+        let absent = LandingSignals {
+            node_text: Some("header".to_string()),
+            range_text: None,
+            before_value: None,
+            after_value: Some("header".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&absent, "1018595918"), Some(Landing::Absent));
     }
 
     #[test]
