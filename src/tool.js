@@ -96,6 +96,13 @@ export const Config = Schema.object({
   // common round-trip sink (each field costs an observe→act→observe cycle), and
   // the guidance now names it as the preferred path for 2+ field forms.
   enabledTools: Schema.array(Schema.string()).default(['batch_actions', 'scroll_element', 'fill_form']),
+  /**
+   * Which agent preset this tool row is mounted under (V2 experience scope).
+   * The experience layer filters notes by it: a note recorded under one preset never
+   * injects into another. Empty means "unknown" - scoped notes fail closed and only
+   * unscoped ('all') notes inject.
+   */
+  preset: Schema.string().default(''),
 })
 
 const OUTPUT_SCHEMA = {
@@ -179,6 +186,9 @@ export function apply(ctx, config) {
   const state = {
     browserUnlocked: false,
     exposedNames: [],
+    /** V2 experience scope: which preset this row is mounted under (from config). */
+    preset: String(config.preset || '').trim().toLowerCase(),
+    surfaces,
     /**
      * The experience layer is owned by the host-plane service, which owns the store and
      * the turn lifecycle. Without it -- a harness that never mounted the host plane --
@@ -418,7 +428,7 @@ function digestForCall(state, method, turnMeta, value) {
       if (state.digested.has(memo)) continue
       state.digested.add(memo)
       if (state.digested.size > 256) state.digested.clear()
-      const digest = experience.digest(key, app)
+      const digest = experience.digest(key, app, { preset: state.preset })
       if (digest) return digest
     }
   } catch {
@@ -450,12 +460,14 @@ function experienceTool(state) {
   return defineTool({
     name: EXPERIENCE_TOOL_NAME,
     description:
-      'Read, record and update the machine-local Computer Use experience notes: what went wrong in earlier ' +
-      'tasks on this machine, the suspected cause, the workaround and the date. Notes are ADVISORY only - ' +
-      'they never block or replace a tool call, the current observation always wins over a stored note, and ' +
-      'a software upgrade can invalidate any of them. Use action "list" before driving an app you have not ' +
-      'driven on this machine, and after a task that hit an app-specific problem you diagnosed or worked ' +
-      'around, record one short note with action "record".',
+      'Machine-local Computer Use experience, in two deliberately different layers. ' +
+      'action "snapshot" returns the LIVE state card (preset, bundles, which MCP servers each preset mounts) - ' +
+      'state questions like "what is mounted right now" are answered from here, never from a note. ' +
+      'Notes (list/get/record/update) are durable facts and pitfalls written by earlier tasks: each carries a ' +
+      'scope (which presets/apps see it) and a volatility (how long it holds). Notes are ADVISORY only - they ' +
+      'never block or replace a tool call, the current observation always wins, and a note must NOT record state ' +
+      'snapshots (mounted rows, PIDs, ports): those change and then the note lies. Use "list" before driving an ' +
+      'app you have not driven on this machine, and after a task that hit an app-specific problem, "record" one note.',
     // DSH parameter schema: an implicit property map (NOT JSON Schema). defineTool
     // compiles it into the model-facing object schema and validates the arguments; the
     // sidecar tools skip this by registering plain objects, which is why their official
@@ -463,15 +475,47 @@ function experienceTool(state) {
     parameters: {
       action: {
         type: 'string',
-        enum: ['list', 'get', 'record', 'update', 'stats'],
-        description: 'What to do: list (default), get, record, update or stats.',
+        enum: ['list', 'get', 'record', 'update', 'stats', 'snapshot'],
+        description: 'What to do: list (default), get, record, update, stats or snapshot (live state card).',
       },
       app: { type: 'string', description: 'App id from a Computer Use window/app object, for example blender.exe.' },
       id: { type: 'string', description: 'Note id, for get and update.' },
       tag: { type: 'string', description: 'list: only notes carrying this tag, for example ax-empty.' },
       since: { type: 'string', description: 'list: only notes dated on or after YYYY-MM-DD.' },
       limit: { type: 'number', description: 'list: maximum notes returned (default 10, max 50).' },
-      symptom: { type: 'string', description: 'record: what you observed, objectively.' },
+      statement: {
+        type: 'string',
+        description:
+          'record: the one-line conclusion, written so it still holds in another session. ' +
+          'Never a state snapshot (mounted rows, PIDs, ports) - those go stale and then the note lies.',
+      },
+      kind: {
+        type: 'string',
+        enum: ['fact', 'pitfall', 'pointer'],
+        description: 'record: fact (durable truth), pitfall (trap + way out) or pointer (where to look). Default pitfall.',
+      },
+      scopePresets: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'record: which agent presets may see this note, for example ["computer-use"]. ' +
+          'Default: the preset this session runs under. Use ["all"] only for machine-wide truths.',
+      },
+      scopeApps: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'record: which apps this note applies to. Default: all.',
+      },
+      volatility: {
+        type: 'string',
+        enum: ['durable', 'until-config-change', 'until-date'],
+        description:
+          'record: how long the statement holds. until-config-change: labelled for recheck after config edits. ' +
+          'until-date: needs expiresAt, then injects like any other note until that date. Default durable.',
+      },
+      expiresAt: { type: 'string', description: 'record: required when volatility is "until-date" (YYYY-MM-DD or ISO).' },
+      verifyHint: { type: 'string', description: 'record (optional): how a later session can re-verify this note.' },
+      symptom: { type: 'string', description: 'record: deprecated alias of statement; longer observation if it does not fit one line.' },
       context: { type: 'string', description: 'record: environment that matters (DPI, window state, version).' },
       cause: { type: 'string', description: 'record/update: suspected cause, marked as suspected.' },
       workaround: { type: 'string', description: 'record/update: what actually worked.' },
@@ -492,7 +536,28 @@ function experienceTool(state) {
       const input = args && typeof args === 'object' ? args : {}
       const experience = state.experience
       const action = String(input.action || 'list').trim().toLowerCase()
-      if (action === 'record') return { ok: true, action, ...experience.record(input) }
+      if (action === 'snapshot') {
+        return {
+          ok: true,
+          action,
+          ...experience.snapshot({
+            preset: state.preset,
+            surfaces: state.surfaces,
+            exposedTools: state.exposedNames,
+          }),
+        }
+      }
+      if (action === 'record') {
+        const scoped = { ...input }
+        if (scoped.scopePresets !== undefined || scoped.scopeApps !== undefined) {
+          scoped.scope = {
+            presets: scoped.scopePresets === undefined ? undefined : scoped.scopePresets,
+            apps: scoped.scopeApps === undefined ? undefined : scoped.scopeApps,
+          }
+        }
+        if (scoped.preset === undefined) scoped.preset = state.preset
+        return { ok: true, action, ...experience.record(scoped) }
+      }
       if (action === 'update') {
         const id = String(input.id || '').trim()
         if (!id) throw new Error('experience: update needs an "id"')
@@ -507,7 +572,7 @@ function experienceTool(state) {
       }
       if (action === 'stats') return { ok: true, action, ...experience.stats() }
       if (action === 'list') return { ok: true, action, ...experience.list(input) }
-      throw new Error('experience: unknown action "' + action + '" (list, get, record, update, stats)')
+      throw new Error('experience: unknown action "' + action + '" (list, get, record, update, stats, snapshot)')
     },
     isConcurrencySafe() {
       return false

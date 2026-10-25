@@ -129,13 +129,20 @@ test('EXP-2 the same symptom merges instead of piling up, whatever the tags say'
   }
 })
 
-test('EXP-3 a note without a symptom or without a cause/workaround is refused', () => {
+test('EXP-3 a note without a statement is refused; a statement alone is enough (V3)', () => {
   const { dir, store } = tempStore()
   try {
-    assert.throws(() => store.record({ app: 'blender.exe', symptom: 'x' }), /at least one of/)
-    assert.throws(() => store.record({ app: 'blender.exe', cause: 'because' }), /"symptom" is required/)
+    assert.throws(() => store.record({ app: 'blender.exe', cause: 'because' }), /"statement" is required/)
     assert.throws(() => store.record({ symptom: 'no app', cause: 'c' }), /"app" is required/)
+    assert.throws(
+      () => store.record({ app: 'blender.exe', statement: 's', volatility: 'until-date' }),
+      /until-date" needs an "expiresAt"/,
+    )
     assert.equal(fs.existsSync(path.join(dir, 'lessons.jsonl')), false, 'a refused record writes nothing')
+    const ok = store.record({ app: 'blender.exe', statement: 'self-drawn viewports expose no UIA tree' })
+    assert.equal(ok.created, true, 'a statement alone is a valid note - cause/workaround are optional now')
+    assert.equal(ok.entry.kind, 'pitfall', 'kind defaults to pitfall')
+    assert.equal(ok.entry.volatility, 'durable', 'volatility defaults to durable')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -363,10 +370,13 @@ test('EXP-12 the experience tool reaches the registry with a compiled parameter 
     const tool = harness.registered.get(EXPERIENCE_TOOL_NAME)
     assert.ok(tool, 'the experience tool is registered next to the desktop tools')
     assert.equal(tool.parameters.type, 'object')
-    assert.deepEqual(tool.parameters.properties.action.enum, ['list', 'get', 'record', 'update', 'stats'])
+    assert.deepEqual(tool.parameters.properties.action.enum, ['list', 'get', 'record', 'update', 'stats', 'snapshot'])
     assert.equal(tool.parameters.properties.tags.type, 'array')
     assert.equal(tool.parameters.properties.stale.type, 'boolean')
+    assert.equal(tool.parameters.properties.scopePresets.type, 'array', 'V2: the record carries an explicit audience')
+    assert.deepEqual(tool.parameters.properties.volatility.enum, ['durable', 'until-config-change', 'until-date'])
     assert.match(tool.description, /ADVISORY only/)
+    assert.match(tool.description, /snapshot/, 'V3: state questions point at the live snapshot action')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -395,6 +405,100 @@ test('EXP-13 hand-written notes in manual.jsonl are read, and never rewritten', 
     store.record({ app: 'blender.exe', symptom: 'a note the model adds', cause: 'because', outcome: 'partial', tags: ['ax-empty'] })
     assert.equal(fs.readFileSync(path.join(dir, 'manual.jsonl'), 'utf8'), JSON.stringify(manual) + '\n', 'the hand-written file is never rewritten')
     assert.equal(store.list({ app: 'blender.exe' }).count, 2)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('EXP-14 a scoped note never injects into another preset (V2)', () => {
+  const { dir, store } = tempStore()
+  try {
+    store.record({ app: 'blender.exe', statement: 'CU-only pitfall', preset: 'computer-use', workaround: 'w' })
+    store.record({ app: 'blender.exe', statement: 'machine-wide truth', scopePresets: 'all', kind: 'fact' })
+    const cu = store.digest('blender', 'blender.exe', { preset: 'computer-use' })
+    assert.equal(cu.notes.length, 2, 'CU sees its own note plus the machine-wide one')
+    const rev = store.digest('blender', 'blender.exe', { preset: 'reverse' })
+    assert.equal(rev.notes.length, 1, 'reverse only sees the machine-wide one')
+    assert.equal(rev.notes[0].statement, 'machine-wide truth')
+    const anonymous = store.digest('blender', 'blender.exe', { preset: '' })
+    assert.equal(anonymous.notes.length, 1, 'without a preset identity, scoped notes fail closed')
+    const text = formatDigest(cu)
+    assert.match(text, /scope: presets=computer-use/, 'the injected block shows the note audience')
+    assert.match(text, /written 0d ago/, 'the injected block shows the note age')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('EXP-15 volatility: until-date expires, until-config-change is labelled for recheck', () => {
+  const { dir, store } = tempStore()
+  try {
+    store.record({
+      app: 'blender.exe', statement: 'temporary workaround', workaround: 'w',
+      volatility: 'until-date', expiresAt: '2026-01-01', preset: 'computer-use',
+    })
+    store.record({
+      app: 'blender.exe', statement: 'row layout may change after a config edit',
+      volatility: 'until-config-change', preset: 'computer-use',
+    })
+    const digest = store.digest('blender', 'blender.exe', { preset: 'computer-use' })
+    assert.equal(digest.notes.length, 2)
+    const expired = digest.notes.find(note => note.expired)
+    assert.ok(expired, 'an until-date note past its date stays visible but labelled expired')
+    assert.equal(expired.expiresAt, '2026-01-01T00:00:00.000Z')
+    const flagged = digest.notes.find(note => note.recheckAfterConfigChange)
+    assert.ok(flagged, 'an until-config-change note carries the recheck label')
+    assert.match(formatDigest(digest), /recheck after config changes/)
+    const strict = new ExperienceStore({ includeStale: false }, { dir, seedPath: path.join(dir, 'no-seed.jsonl') })
+    const strictDigest = strict.digest('blender', 'blender.exe', { preset: 'computer-use' })
+    assert.equal(strictDigest.notes.length, 1, 'includeStale=false drops the expired until-date note…')
+    assert.equal(strictDigest.notes[0].recheckAfterConfigChange, true, '…but keeps the labelled recheck note: it is not stale, it is unverified')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('EXP-16 the snapshot card is live composition data, independent of any note (V3)', () => {
+  const { dir, store } = tempStore()
+  try {
+    const card = store.snapshot({ preset: 'computer-use', surfaces: ['computer'], exposedTools: ['click'] })
+    assert.equal(card.kind, 'live-snapshot')
+    assert.equal(card.preset, 'computer-use')
+    assert.equal(card.surfaces[0], 'computer')
+    assert.equal(card.exposedTools.length, 1)
+    // Temp dir has no profile files: the card degrades instead of throwing (D-1).
+    assert.ok(card.bundles, 'bundles degrade to unknown without a profile')
+    assert.ok(card.mcpRowsByPreset, 'per-preset MCP rows degrade to unknown without a profile')
+
+    const patch = path.join(dir, 'fake.presets.patch.yml')
+    fs.writeFileSync(patch, [
+      '- insert:',
+      '    - id: preset-browser',
+      '      config:',
+      '        plugins:',
+      '          - id: mcp-chrome-devtools',
+      '          - id: mcp-context7',
+      '    - id: preset-computer-use',
+      '      config:',
+      '        plugins:',
+      '          - id: mcp-chrome-devtools',
+      '    - id: preset-reverse',
+      '      config:',
+      '        plugins:',
+      '          - id: mcp-chrome-devtools',
+      '          - id: mcp-rea',
+      '          - id: mcp-context7',
+    ].join('\n'))
+    const rows = store.mcpRowsByPreset(patch)
+    assert.deepEqual(rows.rows.browser, ['mcp-chrome-devtools', 'mcp-context7'])
+    assert.deepEqual(rows.rows['computer-use'], ['mcp-chrome-devtools'])
+    assert.deepEqual(rows.rows.reverse, ['mcp-chrome-devtools', 'mcp-rea', 'mcp-context7'])
+
+    store.record({ app: 'blender.exe', statement: 'a note exists', preset: 'computer-use' })
+    const again = store.snapshot({ preset: 'computer-use' })
+    assert.notEqual(again.at, card.at, 'the card is regenerated on every call')
+    assert.equal(again.preset, 'computer-use')
+    assert.equal(store.digest('blender', 'blender.exe', { preset: 'computer-use' }).notes.length, 1, 'notes and the snapshot stay separate layers')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

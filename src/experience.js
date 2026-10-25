@@ -3,13 +3,18 @@
  *
  * Two record kinds, deliberately different in trust:
  *
- *   lessons      prose the model writes after a task (symptom, suspected cause,
- *                workaround, date). ADVISORY ONLY: no lesson can block, rewrite or
- *                gate a Computer Use call, and the current observation always wins
- *                over a stored note. Software updates can invalidate them.
+ *   lessons      one-line statements the model writes after a task (V2: each carries a
+ *                scope - which presets/apps see it - and a volatility - how long it
+ *                holds). ADVISORY ONLY: no lesson can block, rewrite or gate a Computer
+ *                Use call, and the current observation always wins over a stored note.
+ *                V3 discipline: a lesson records a durable fact or a pitfall - anything
+ *                readable from the system belongs to the live snapshot, not here.
  *   observations machine-written facts (method, ok/error, app, AX presence, window
  *                geometry, timing). Typed text, element names and screenshot bytes
  *                never reach these files.
+ *   snapshot     NOT stored: regenerated on every call from the live system (bundles,
+ *                per-preset MCP rows). State questions are answered from here, which is
+ *                why a stale lesson can no longer masquerade as current state.
  *
  * The store lives inside the plugin folder by explicit decision (D-1):
  * <pluginRoot>/.experience/, gitignored. The experience.store config points it
@@ -48,6 +53,7 @@ export const EXPERIENCE_DEFAULTS = {
 }
 
 const LIMITS = {
+  statement: 300,
   symptom: 400,
   context: 400,
   cause: 500,
@@ -56,7 +62,27 @@ const LIMITS = {
   app: 120,
   tag: 32,
   tags: 8,
+  verifyHint: 200,
+  scopeItem: 60,
 }
+
+/**
+ * V2 redesign (2026-10-25): a note carries an explicit audience (scope) and an
+ * explicit lifetime (volatility), because the failure that motivated the redesign
+ * was a note describing host-level MCP rows being injected into a Computer Use
+ * session after those rows had moved into presets.
+ *
+ *   scope      who may see it:  { presets: 'all' | [...], apps: 'all' | [...] }
+ *   volatility how long it holds: 'durable' | 'until-config-change' | 'until-date'
+ *              ('until-date' pairs with expiresAt; 'until-config-change' is only
+ *              LABELLED in phase 1 - auto-invalidation is the phase-2 fingerprint work)
+ *
+ * V3 discipline lives in the tool copy, not in code: a note records a durable fact or
+ * a pitfall ("reading of the world"); anything readable from the system (mounted rows,
+ * PIDs, ports) belongs to the live snapshot action instead.
+ */
+export const VOLATILITY = new Set(['durable', 'until-config-change', 'until-date'])
+export const NOTE_KINDS = new Set(['fact', 'pitfall', 'pointer'])
 
 const OUTCOME_RANK = { worked: 3, partial: 2, unknown: 1, failed: 0 }
 const MAX_OBSERVATION_BYTES = 512 * 1024
@@ -168,6 +194,58 @@ export function isoDate(value) {
   return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
 }
 
+/* ----------------------------------------------------- scope & volatility --- */
+
+/** 'all' | a lower-cased list of preset ids / app keys; '' or missing picks the fallback. */
+function normalizeScopeList(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback
+  if (value === 'all') return 'all'
+  const list = Array.isArray(value) ? value : [value]
+  const out = []
+  for (const raw of list) {
+    const item = clamp(raw, LIMITS.scopeItem).toLowerCase()
+    if (!item || item === 'all' || out.includes(item)) continue
+    out.push(item)
+  }
+  return out.length > 0 ? out : fallback
+}
+
+/** Missing scope on a hand-written or legacy record means "visible everywhere". */
+export function normalizeScope(scope, fallbackPresets) {
+  const raw = scope && typeof scope === 'object' && !Array.isArray(scope) ? scope : {}
+  return {
+    presets: normalizeScopeList(raw.presets, fallbackPresets === undefined ? 'all' : fallbackPresets),
+    apps: normalizeScopeList(raw.apps, 'all'),
+  }
+}
+
+export function normalizeVolatility(volatility, expiresAt) {
+  if (volatility === 'until-date') {
+    const stamp = Date.parse(String(expiresAt || ''))
+    if (Number.isFinite(stamp)) return { volatility: 'until-date', expiresAt: new Date(stamp).toISOString() }
+  }
+  return { volatility: VOLATILITY.has(volatility) ? volatility : 'durable', expiresAt: null }
+}
+
+/** Fail-closed: a scoped note is invisible when the reader has no preset identity. */
+export function scopeMatches(scope, context) {
+  const read = context && typeof context === 'object' ? context : {}
+  const preset = String(read.preset || '').trim().toLowerCase()
+  const appKey = String(read.appKey || '').trim().toLowerCase()
+  const presets = scope && scope.presets !== undefined ? scope.presets : 'all'
+  const apps = scope && scope.apps !== undefined ? scope.apps : 'all'
+  if (presets !== 'all' && (!preset || !(Array.isArray(presets) ? presets : [presets]).includes(preset))) return false
+  if (apps !== 'all' && (!appKey || !(Array.isArray(apps) ? apps : [apps]).includes(appKey))) return false
+  return true
+}
+
+/** 'until-date' notes past their expiresAt read like any other expired note. */
+export function volatilityExpired(entry, now) {
+  if (!entry || entry.volatility !== 'until-date' || !entry.expiresAt) return false
+  const stamp = Date.parse(entry.expiresAt)
+  return Number.isFinite(stamp) && stamp < now.getTime()
+}
+
 function ageDaysOf(entry, now) {
   const stamp = Date.parse(entry.lastSeenAt || entry.date || '')
   if (!Number.isFinite(stamp)) return 0
@@ -190,7 +268,7 @@ function isExpired(entry, now, config) {
 export function signatureOf(entry) {
   const parts = [
     appKeyOf(entry && entry.app) || '',
-    normalizeForSignature(entry && entry.symptom),
+    normalizeForSignature(entry && entry.statement),
   ]
   return crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 12)
 }
@@ -204,15 +282,22 @@ function newId(appKey, symptom, date) {
 export function normalizeEntry(record, source) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return null
   const app = normalizeAppSpec(record.app)
-  const symptom = clamp(record.symptom, LIMITS.symptom)
-  if (!app || !symptom) return null
+  // V3: the one-line conclusion is the entry's content; "symptom" is the legacy alias.
+  const statement = clamp(record.statement || record.symptom, LIMITS.statement)
+  if (!app || !statement) return null
+  const scope = normalizeScope(record.scope)
+  const volatility = normalizeVolatility(record.volatility, record.expiresAt)
   const entry = {
-    id: clamp(record.id, 80) || newId(appKeyOf(app), symptom, record.date),
+    id: clamp(record.id, 80) || newId(appKeyOf(app), statement, record.date),
     date: /^\d{4}-\d{2}-\d{2}$/.test(String(record.date || '')) ? String(record.date) : isoDate(record.lastSeenAt),
     lastSeenAt: String(record.lastSeenAt || record.date || new Date().toISOString()),
     seenCount: Number.isFinite(Number(record.seenCount)) && Number(record.seenCount) > 0 ? Number(record.seenCount) : 1,
     app,
-    symptom,
+    statement,
+    kind: NOTE_KINDS.has(record.kind) ? record.kind : 'pitfall',
+    scope,
+    volatility: volatility.volatility,
+    expiresAt: volatility.expiresAt,
     outcome: OUTCOME_RANK[record.outcome] === undefined ? 'unknown' : record.outcome,
     tags: normalizeTags(record.tags),
     source: ['model', 'user', 'seed', 'auto'].includes(record.source) ? record.source : (source || 'model'),
@@ -220,9 +305,13 @@ export function normalizeEntry(record, source) {
     stale: record.stale === true,
     supersededBy: record.supersededBy ? clamp(record.supersededBy, 80) : null,
   }
+  if (record.symptom && record.statement && record.symptom !== record.statement) {
+    entry.symptom = clamp(record.symptom, LIMITS.symptom)
+  }
   if (record.context) entry.context = clamp(record.context, LIMITS.context)
   if (record.cause) entry.cause = clamp(record.cause, LIMITS.cause)
   if (record.workaround) entry.workaround = clamp(record.workaround, LIMITS.workaround)
+  if (record.verifyHint) entry.verifyHint = clamp(record.verifyHint, LIMITS.verifyHint)
   if (record.verified && typeof record.verified === 'object' && record.verified.at) {
     entry.verified = { at: String(record.verified.at), result: String(record.verified.result || entry.outcome) }
   }
@@ -231,24 +320,45 @@ export function normalizeEntry(record, source) {
   return entry
 }
 
-/** Build a new model-authored entry; throws when the record has no actionable content. */
+/**
+ * Build a new model-authored entry; throws when the record has no actionable content.
+ *
+ * V3 contract: "statement" is the one-line conclusion that must still hold in another
+ * session; state snapshots (mounted rows, PIDs, ports) do not belong here - the caller
+ * is expected to steer state questions to the live snapshot action instead. The preset
+ * the note was written in becomes its default audience, so a note recorded under one
+ * preset never leaks into another one (the failure that motivated the redesign).
+ */
 export function buildLesson(input, now) {
   const source = input && typeof input === 'object' ? input : {}
   const app = normalizeAppSpec(source.app)
   if (!app) throw new Error('experience: "app" is required (the app id a Computer Use call returned)')
-  const symptom = clamp(source.symptom, LIMITS.symptom)
-  if (!symptom) throw new Error('experience: "symptom" is required - what did you observe?')
+  const statement = clamp(source.statement || source.symptom, LIMITS.statement)
+  if (!statement) {
+    throw new Error('experience: "statement" is required - one line that stays true in another session (not a state snapshot)')
+  }
   const cause = clamp(source.cause, LIMITS.cause)
   const workaround = clamp(source.workaround, LIMITS.workaround)
-  if (!cause && !workaround) throw new Error('experience: record at least one of "cause" or "workaround"')
   const at = now instanceof Date ? now : new Date(now === undefined ? Date.now() : now)
+  const rawScope = source.scope !== undefined || (source.scopePresets === undefined && source.scopeApps === undefined)
+    ? source.scope
+    : { presets: source.scopePresets, apps: source.scopeApps }
+  const scope = normalizeScope(rawScope, source.preset ? [String(source.preset).toLowerCase()] : 'all')
+  const volatility = normalizeVolatility(source.volatility, source.expiresAt)
+  if (source.volatility === 'until-date' && !volatility.expiresAt) {
+    throw new Error('experience: volatility "until-date" needs an "expiresAt" (YYYY-MM-DD or ISO)')
+  }
   const entry = {
     id: '',
     date: /^\d{4}-\d{2}-\d{2}$/.test(String(source.date || '')) ? String(source.date) : isoDate(at),
     lastSeenAt: at.toISOString(),
     seenCount: 1,
     app,
-    symptom,
+    statement,
+    kind: NOTE_KINDS.has(source.kind) ? source.kind : 'pitfall',
+    scope,
+    volatility: volatility.volatility,
+    expiresAt: volatility.expiresAt,
     outcome: OUTCOME_RANK[source.outcome] === undefined ? 'unknown' : source.outcome,
     tags: normalizeTags(source.tags),
     source: 'model',
@@ -256,11 +366,13 @@ export function buildLesson(input, now) {
     stale: false,
     supersededBy: null,
   }
+  if (source.symptom && source.symptom !== statement) entry.symptom = clamp(source.symptom, LIMITS.symptom)
   if (cause) entry.cause = cause
   if (workaround) entry.workaround = workaround
   if (source.context) entry.context = clamp(source.context, LIMITS.context)
+  if (source.verifyHint) entry.verifyHint = clamp(source.verifyHint, LIMITS.verifyHint)
   if (source.fromObservation) entry.fromObservation = clamp(source.fromObservation, 80)
-  entry.id = newId(appKeyOf(app) || 'app', symptom, at)
+  entry.id = newId(appKeyOf(app) || 'app', statement, at)
   entry.signature = signatureOf(entry)
   return entry
 }
@@ -283,13 +395,19 @@ function noteOf(entry, now, config) {
   const note = {
     date: entry.date,
     outcome: entry.outcome,
-    symptom: clamp(entry.symptom, 160),
+    kind: entry.kind || 'pitfall',
+    volatility: entry.volatility || 'durable',
+    statement: clamp(entry.statement, 200),
     action: clamp(action, Number(config.noteChars) || 220),
     seen: entry.seenCount || 1,
     ageDays: ageDaysOf(entry, now),
+    scope: entry.scope || { presets: 'all', apps: 'all' },
   }
+  if (entry.expiresAt) note.expiresAt = entry.expiresAt
   if (entry.stale) note.stale = true
+  else if (volatilityExpired(entry, now)) note.expired = true
   else if (isExpired(entry, now, config)) note.mayBeOutdated = true
+  if (entry.volatility === 'until-config-change') note.recheckAfterConfigChange = true
   if (entry.source && entry.source !== 'model') note.source = entry.source
   if (entry.tags && entry.tags.length) note.tags = entry.tags.slice(0, 6)
   return note
@@ -300,19 +418,26 @@ export function summarizeEntry(entry, now, config) {
     id: entry.id,
     date: entry.date,
     app: entry.app && entry.app.id ? entry.app.id : '',
+    kind: entry.kind || 'pitfall',
+    statement: clamp(entry.statement, 240),
+    scope: entry.scope || { presets: 'all', apps: 'all' },
+    volatility: entry.volatility || 'durable',
     outcome: entry.outcome,
-    symptom: clamp(entry.symptom, 200),
     tags: entry.tags || [],
     seen: entry.seenCount || 1,
     source: entry.source,
     lastSeenAt: entry.lastSeenAt,
   }
+  if (entry.expiresAt) view.expiresAt = entry.expiresAt
   if (entry.cause) view.cause = clamp(entry.cause, 300)
   if (entry.workaround) view.workaround = clamp(entry.workaround, 300)
   if (entry.context) view.context = clamp(entry.context, 200)
+  if (entry.verifyHint) view.verifyHint = entry.verifyHint
+  if (entry.symptom && entry.symptom !== entry.statement) view.symptom = clamp(entry.symptom, 200)
   if (entry.supersededBy) view.supersededBy = entry.supersededBy
   if (entry.stale) view.stale = true
-  if (isExpired(entry, now, config)) view.mayBeOutdated = true
+  if (volatilityExpired(entry, now)) view.expired = true
+  else if (isExpired(entry, now, config)) view.mayBeOutdated = true
   return view
 }
 
@@ -321,12 +446,23 @@ export function formatDigest(digest) {
   if (!digest) return ''
   const lines = []
   lines.push('Experience notes for ' + digest.app + ' - machine-local notes from earlier tasks here.')
-  lines.push('ADVISORY ONLY: not rules and not a gate. An upgrade, a DPI or configuration change can')
-  lines.push('invalidate them, and the current observation always wins over a stored note.')
+  lines.push('ADVISORY ONLY: not rules and not a gate; the current observation always wins over a')
+  lines.push('stored note. Each note is scoped (which presets/apps see it) and dated - check both')
+  lines.push('before relying on one. These are NOT live state: for what is mounted or running right')
+  lines.push('now, call computer_use_experience({action: "snapshot"}).')
   for (const note of digest.notes) {
-    const flag = note.stale ? ', marked stale' : note.mayBeOutdated ? ', may be outdated' : ''
-    const head = '- ' + note.date + ' [' + note.outcome + flag + '] ' + note.symptom
-    lines.push(note.action ? head + ' -> ' + note.action : head)
+    const flags = []
+    if (note.stale) flags.push('stale')
+    if (note.expired) flags.push('expired ' + (note.expiresAt || ''))
+    if (note.mayBeOutdated) flags.push('may be outdated')
+    if (note.volatility === 'until-config-change') flags.push('recheck after config changes')
+    const scope = note.scope && note.scope.presets !== undefined
+      ? 'scope: presets=' + (Array.isArray(note.scope.presets) ? note.scope.presets.join('|') : note.scope.presets)
+      : ''
+    const head = '- ' + note.date + ' [' + (note.kind || 'pitfall') + '/' + (note.volatility || 'durable')
+      + (flags.length > 0 ? ', ' + flags.join(', ') : '') + '] ' + note.statement
+    const tail = (scope ? ' (' + scope + ', written ' + note.ageDays + 'd ago)' : ' (written ' + note.ageDays + 'd ago)')
+    lines.push(note.action ? head + ' -> ' + note.action + tail : head + tail)
   }
   if (digest.pending > 0) {
     lines.push(digest.pending + ' earlier problem(s) on this app were never written up. If you learn the cause')
@@ -630,6 +766,8 @@ export class ExperienceStore {
     lines.push('Machine-local notes written after Computer Use tasks on this machine.')
     lines.push('**Reference only**: software updates, DPI or configuration changes can invalidate them,')
     lines.push('no note can block a tool call, and the current observation always wins.')
+    lines.push('Each note carries a scope (which presets/apps see it) and a volatility (how long it holds).')
+    lines.push('Live state (mounted rows, versions, processes) is answered by the snapshot action, never by a note.')
     lines.push('')
     lines.push('- Store: ' + this.dir)
     lines.push('- Generated: ' + new Date().toISOString())
@@ -648,10 +786,14 @@ export class ExperienceStore {
       for (const entry of group[1]) {
         lines.push('### ' + entry.date + ' - ' + entry.outcome + ' - ' + entry.id)
         lines.push('')
-        lines.push('- symptom: ' + entry.symptom)
+        lines.push('- statement: ' + (entry.statement || ''))
+        lines.push('- kind: ' + (entry.kind || 'pitfall') + ' / volatility: ' + (entry.volatility || 'durable') + (entry.expiresAt ? ' until ' + entry.expiresAt : ''))
+        lines.push('- scope: presets=' + (entry.scope && entry.scope.presets !== undefined ? (Array.isArray(entry.scope.presets) ? entry.scope.presets.join('|') : entry.scope.presets) : 'all')
+          + ', apps=' + (entry.scope && entry.scope.apps !== undefined ? (Array.isArray(entry.scope.apps) ? entry.scope.apps.join('|') : entry.scope.apps) : 'all'))
         if (entry.context) lines.push('- context: ' + entry.context)
         if (entry.cause) lines.push('- cause (suspected): ' + entry.cause)
         if (entry.workaround) lines.push('- workaround: ' + entry.workaround)
+        if (entry.verifyHint) lines.push('- verify: ' + entry.verifyHint)
         if (entry.tags && entry.tags.length) lines.push('- tags: ' + entry.tags.join(', '))
         const flags = []
         if (entry.source !== 'model') flags.push('source ' + entry.source)
@@ -737,6 +879,21 @@ export class ExperienceStore {
       if (source.supersededBy !== undefined) entry.supersededBy = source.supersededBy ? clamp(source.supersededBy, 80) : null
       if (source.stale !== undefined) entry.stale = source.stale === true
       if (source.tags !== undefined) entry.tags = normalizeTags(source.tags)
+      if (source.statement !== undefined) entry.statement = clamp(source.statement, LIMITS.statement)
+      if (source.kind !== undefined) {
+        if (!NOTE_KINDS.has(source.kind)) throw new Error('experience: kind must be fact, pitfall or pointer')
+        entry.kind = source.kind
+      }
+      if (source.scope !== undefined) entry.scope = normalizeScope(source.scope, entry.scope && entry.scope.presets)
+      if (source.volatility !== undefined || source.expiresAt !== undefined) {
+        const next = normalizeVolatility(
+          source.volatility === undefined ? entry.volatility : source.volatility,
+          source.expiresAt === undefined ? entry.expiresAt : source.expiresAt,
+        )
+        entry.volatility = next.volatility
+        entry.expiresAt = next.expiresAt
+      }
+      if (source.verifyHint !== undefined) entry.verifyHint = source.verifyHint ? clamp(source.verifyHint, LIMITS.verifyHint) : undefined
       if (source.verified) {
         const result = source.verified === true ? (entry.outcome === 'unknown' ? 'worked' : entry.outcome) : String(source.verified)
         entry.verified = { at: new Date().toISOString(), result }
@@ -784,8 +941,13 @@ export class ExperienceStore {
     return summarizeEntry(entry, new Date(), this.config)
   }
 
-  /** The advisory block attached to the first observation of an app in a turn. */
-  digest(appKey, appName) {
+  /**
+   * The advisory block attached to the first observation of an app in a turn.
+   * V2: `context.preset` filters by the note's scope, so a note recorded under one
+   * preset never injects into another one; expired until-date notes behave like
+   * stale ones (visible but labelled under the default includeStale, dropped otherwise).
+   */
+  digest(appKey, appName, context) {
     if (!this.enabled || this.config.injectDigest === false) return null
     const key = String(appKey || '').toLowerCase().replace(/\.exe$/, '')
     if (!key) return null
@@ -798,7 +960,8 @@ export class ExperienceStore {
     const now = new Date()
     const matches = entries
       .filter(entry => !entry.supersededBy && appKeyOf(entry.app) === key)
-      .filter(entry => this.config.includeStale !== false || (!entry.stale && !isExpired(entry, now, this.config)))
+      .filter(entry => scopeMatches(entry.scope, { preset: context && context.preset, appKey: key }))
+      .filter(entry => this.config.includeStale !== false || (!entry.stale && !volatilityExpired(entry, now) && !isExpired(entry, now, this.config)))
       .sort((a, b) => rankOf(b, now, this.config) - rankOf(a, now, this.config))
     const pending = this.pendingFor(key)
     if (matches.length === 0 && pending === 0) return null
@@ -817,6 +980,60 @@ export class ExperienceStore {
     }
     if (formatDigest(digest).length > maxChars && digest.notes.length > 0) digest.notes = []
     return digest
+  }
+
+  /* ------------------------------------------------------------- snapshot --- */
+
+  /**
+   * V3: the live state card. Anything readable from the system (mounted MCP rows,
+   * bundles, the preset this session runs under) is answered from HERE, regenerated on
+   * every call, never from a stored note. Best-effort by contract (D-1): a missing or
+   * unreadable file degrades that one field to "unknown" and never throws.
+   */
+  snapshot(facts) {
+    const input = facts && typeof facts === 'object' ? facts : {}
+    const card = {
+      kind: 'live-snapshot',
+      at: new Date().toISOString(),
+      preset: clamp(input.preset, 60) || 'unknown',
+      note: 'live state, regenerated on every call; a stored lesson cannot answer state questions',
+    }
+    if (Array.isArray(input.surfaces)) card.surfaces = input.surfaces
+    if (Array.isArray(input.exposedTools)) card.exposedTools = input.exposedTools
+    if (input.helper !== undefined) card.helper = input.helper
+    // <profile> = .experience -> dsh-computer-use -> node_modules -> <profile>
+    const profileRoot = path.resolve(this.dir, '..', '..', '..')
+    try {
+      const pkg = JSON.parse(readText(path.join(profileRoot, 'package.json')) || '{}')
+      card.bundles = pkg && pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
+        ? pkg.dsh.profile.bundles
+        : []
+    } catch {
+      card.bundles = 'unknown (profile package.json unreadable)'
+    }
+    card.mcpRowsByPreset = this.mcpRowsByPreset(path.join(profileRoot, 'node_modules', 'dsh-presets-extra', 'cordis.patch.yml'))
+    return card
+  }
+
+  /** Best-effort scan of the generated preset patch: which preset mounts which MCP server. */
+  mcpRowsByPreset(patchFile) {
+    const text = readText(patchFile)
+    if (!text) return { source: patchFile, rows: {}, note: 'patch file missing or unreadable' }
+    const rows = {}
+    let current = null
+    for (const line of text.split('\n')) {
+      const preset = line.match(/^\s*- id: preset-([A-Za-z0-9-]+)\s*$/)
+      if (preset) {
+        current = preset[1]
+        continue
+      }
+      const mcp = line.match(/^\s*- id: (mcp-[A-Za-z0-9-]+)\s*$/)
+      if (mcp && current) {
+        if (!rows[current]) rows[current] = []
+        if (!rows[current].includes(mcp[1])) rows[current].push(mcp[1])
+      }
+    }
+    return { source: patchFile, rows }
   }
 
   /* -------------------------------------------------------- observations --- */
@@ -1041,6 +1258,9 @@ export const NOOP_EXPERIENCE = {
   },
   stats() {
     return { enabled: false, dir: '', lessons: 0, pending: 0, observations: 0, invalid: 0, latest: [] }
+  },
+  snapshot() {
+    return { kind: 'live-snapshot', at: new Date().toISOString(), preset: 'unknown', note: 'experience layer not mounted' }
   },
   renderMarkdownText() {
     return ''
