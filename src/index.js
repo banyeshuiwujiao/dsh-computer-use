@@ -11,7 +11,6 @@ import Schema from '@deepseek-ai/schemastery'
 import { Sidecar, BASE_ENV_ALLOWLIST } from './sidecar.js'
 import { defaultEngineRoot } from './paths.js'
 import { documentationSummary, promptAssetStatus } from './prompt.js'
-import { createExperience } from './experience.js'
 
 /**
  * Declarative turn-lifecycle hooks (PKG-04).
@@ -149,25 +148,6 @@ export const Config = Schema.object({
   serverInstructions: Schema.string().default(
     'UI automation through the DeepSeek Harness Computer Use tools using the initialized session. Codex is not required.',
   ),
-  /**
-   * Local experience layer (DSH extension, not official). Notes written after a task
-   * are attached, as an advisory text block, to the first observation of the same app
-   * in a later turn. Nothing in this layer can block or gate a Computer Use call, and
-   * the store is deliberately inside the plugin folder (decision D-1), gitignored.
-   */
-  experience: Schema.object({
-    enabled: Schema.boolean().default(true),
-    store: Schema.string().default(''),
-    captureObservations: Schema.boolean().default(true),
-    injectDigest: Schema.boolean().default(true),
-    maxEntries: Schema.number().default(3),
-    maxChars: Schema.number().default(900),
-    staleAfterDays: Schema.number().default(90),
-    includeStale: Schema.boolean().default(true),
-    retainEntries: Schema.number().default(200),
-    retainObservationDays: Schema.number().default(30),
-    redactPaths: Schema.boolean().default(true),
-  }),
 })
 
 /**
@@ -206,7 +186,6 @@ export default class ComputerUseService extends Service {
       ...config,
     }
     this.sidecar = new Sidecar(this.config)
-    this.experience = createExperience(this.config.experience)
     this.approved = new Set()
     /**
      * Turn id per conversation, taken from the session events (`turn/start` /
@@ -251,13 +230,6 @@ export default class ComputerUseService extends Service {
       }
       if (event.type !== 'turn/end') return
       const turn = event.data && event.data.turn !== undefined ? String(event.data.turn) : undefined
-      // Close the experience turn for every session, not only the one that owns the
-      // overlay: the observation buffer is keyed by conversation + turn and would leak.
-      try {
-        this.experience.settleTurn(conversationId, turn)
-      } catch {
-        // Advisory layer: a broken store must never break the turn lifecycle.
-      }
       if (conversationId !== null) this.turnByConversation.delete(conversationId)
       const owns = this.ownsOverlay(session)
       const active = conversationId !== null && this.activeConversations.has(conversationId)
@@ -272,11 +244,6 @@ export default class ComputerUseService extends Service {
     })
     ctx.on('session/disposed', session => {
       const id = session?.id === undefined || session?.id === null ? null : String(session.id)
-      try {
-        this.experience.settleTurn(id, undefined)
-      } catch {
-        // Advisory layer: best effort.
-      }
       if (id !== null) this.activeConversations.delete(id)
       if (!this.ownsOverlay(session)) return
       this.lastConversationId = null
@@ -325,9 +292,6 @@ export default class ComputerUseService extends Service {
       promptAssets: promptAssetStatus(),
       documentation: documentationSummary(),
       turnLifecycle: TURN_LIFECYCLE_HOOKS,
-      // DSH extension, not official: the machine-local experience layer (store path,
-      // counts and the newest notes). Advisory notes only; nothing here gates a call.
-      experience: this.experience.stats(),
     }
   }
 

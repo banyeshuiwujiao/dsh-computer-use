@@ -8,14 +8,6 @@ import fs from 'node:fs'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { computerUsePrompt, documentationSummary, promptAssetStatus, BROWSER_REQUIRED_FOR } from './prompt.js'
-import {
-  NOOP_EXPERIENCE,
-  appKeyOf,
-  appsInResult,
-  formatDigest,
-  isDigestMethod,
-  observationFor,
-} from './experience.js'
 
 export const name = 'tool-computer-use'
 export const inject = ['tools', 'dshComputerUse', 'systemPrompt']
@@ -186,18 +178,7 @@ export function apply(ctx, config) {
   const state = {
     browserUnlocked: false,
     exposedNames: [],
-    /** V2 experience scope: which preset this row is mounted under (from config). */
-    preset: String(config.preset || '').trim().toLowerCase(),
     surfaces,
-    /**
-     * The experience layer is owned by the host-plane service, which owns the store and
-     * the turn lifecycle. Without it -- a harness that never mounted the host plane --
-     * the tools keep working and simply carry no notes (I1: the layer is advisory and
-     * can never fail a Computer Use call).
-     */
-    experience: ctx.dshComputerUse.experience || NOOP_EXPERIENCE,
-    /** turnKey + app pairs already annotated this turn, so a digest is injected once. */
-    digested: new Set(),
     /** Basenames of reference documents the model has actually read (PSG-5). */
     readDocuments: new Set(),
     /** Audit trail for operator-configured `allow` grants (APS-01). */
@@ -337,8 +318,6 @@ function healthTool(ctx, state, config, startError) {
         },
         documentation: documentationSummary(),
         promptAssets: promptAssetStatus(),
-        // 经验层已彻底下线（统一维护在受控 Skills 中）：
-        experience: { enabled: false, retired: true },
         documentationGate: {
           requiredFor: REQUIRED_DOCS,
           unshipped: UNSHIPPED_REQUIRED_DOCS,
@@ -373,199 +352,6 @@ function healthTool(ctx, state, config, startError) {
     },
   })
 }
-
-/** Name of the DSH-only experience tool (not one of the official 13 methods). */
-export const EXPERIENCE_TOOL_NAME = 'computer_use_experience'
-
-/**
- * Register the experience tool, degrading instead of failing: a schema mistake in this
- * one tool must never take the whole Computer Use preset down with it.
- */
-function registerExperienceTool(ctx, state) {
-  try {
-    ctx.tools.register(experienceTool(state))
-  } catch (error) {
-    console.error('[dsh-computer-use] skipped tool ' + EXPERIENCE_TOOL_NAME + ': ' + error)
-  }
-}
-
-/**
- * Machine-written facts about one call. Pure observation: it never changes the result
- * and never throws (I1), so a broken store cannot fail a Computer Use call.
- */
-function recordCall(state, method, input, turnMeta, startedAt, value, error) {
-  const experience = state.experience
-  if (!experience || typeof experience.observe !== 'function') return
-  try {
-    const turnKey = turnKeyOf(turnMeta)
-    experience.observe(turnKey, observationFor({
-      method,
-      args: input,
-      value,
-      error,
-      callMs: Date.now() - startedAt,
-      turn: turnKey.split('\u0000')[1] || '',
-    }))
-  } catch {
-    // Observational only.
-  }
-}
-
-/** The advisory digest has been retired: returns null to never inject stale notes. */
-function digestForCall(state, method, turnMeta, value) {
-  return null
-}
-
-function turnKeyOf(turnMeta) {
-  return String(turnMeta && turnMeta.conversationId ? turnMeta.conversationId : '') + '\u0000' +
-    String(turnMeta && turnMeta.turnId ? turnMeta.turnId : 'turn')
-}
-
-function experienceStats(state) {
-  try {
-    const experience = state.experience
-    if (!experience || typeof experience.stats !== 'function') return { enabled: false, dir: '', lessons: 0 }
-    return experience.stats()
-  } catch (error) {
-    return { enabled: false, error: String(error && error.message ? error.message : error) }
-  }
-}
-
-/**
- * The local experience layer, as a tool. Pure JavaScript: it never starts the helper,
- * so notes stay readable and writable with no desktop session running.
- */
-function experienceTool(state) {
-  return defineTool({
-    name: EXPERIENCE_TOOL_NAME,
-    description:
-      'Machine-local Computer Use experience, in two deliberately different layers. ' +
-      'action "snapshot" returns the LIVE state card (preset, bundles, which MCP servers each preset mounts) - ' +
-      'state questions like "what is mounted right now" are answered from here, never from a note. ' +
-      'Notes (list/get/record/update) are durable facts and pitfalls written by earlier tasks: each carries a ' +
-      'scope (which presets/apps see it) and a volatility (how long it holds). Notes are ADVISORY only - they ' +
-      'never block or replace a tool call, the current observation always wins, and a note must NOT record state ' +
-      'snapshots (mounted rows, PIDs, ports): those change and then the note lies. Use "list" before driving an ' +
-      'app you have not driven on this machine, and after a task that hit an app-specific problem, "record" one note.',
-    // DSH parameter schema: an implicit property map (NOT JSON Schema). defineTool
-    // compiles it into the model-facing object schema and validates the arguments; the
-    // sidecar tools skip this by registering plain objects, which is why their official
-    // JSON-Schema parameters never go through this compiler.
-    parameters: {
-      action: {
-        type: 'string',
-        enum: ['list', 'get', 'record', 'update', 'stats', 'snapshot'],
-        description: 'What to do: list (default), get, record, update, stats or snapshot (live state card).',
-      },
-      app: { type: 'string', description: 'App id from a Computer Use window/app object, for example blender.exe.' },
-      id: { type: 'string', description: 'Note id, for get and update.' },
-      tag: { type: 'string', description: 'list: only notes carrying this tag, for example ax-empty.' },
-      since: { type: 'string', description: 'list: only notes dated on or after YYYY-MM-DD.' },
-      limit: { type: 'number', description: 'list: maximum notes returned (default 10, max 50).' },
-      statement: {
-        type: 'string',
-        description:
-          'record: the one-line conclusion, written so it still holds in another session. ' +
-          'Never a state snapshot (mounted rows, PIDs, ports) - those go stale and then the note lies.',
-      },
-      kind: {
-        type: 'string',
-        enum: ['fact', 'pitfall', 'pointer'],
-        description: 'record: fact (durable truth), pitfall (trap + way out) or pointer (where to look). Default pitfall.',
-      },
-      scopePresets: {
-        type: 'array',
-        items: { type: 'string' },
-        description:
-          'record: which agent presets may see this note, for example ["computer-use"]. ' +
-          'Default: the preset this session runs under. Use ["all"] only for machine-wide truths.',
-      },
-      scopeApps: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'record: which apps this note applies to. Default: all.',
-      },
-      volatility: {
-        type: 'string',
-        enum: ['durable', 'until-config-change', 'until-date'],
-        description:
-          'record: how long the statement holds. until-config-change: labelled for recheck after config edits. ' +
-          'until-date: needs expiresAt, then injects like any other note until that date. Default durable.',
-      },
-      expiresAt: { type: 'string', description: 'record: required when volatility is "until-date" (YYYY-MM-DD or ISO).' },
-      verifyHint: { type: 'string', description: 'record (optional): how a later session can re-verify this note.' },
-      symptom: { type: 'string', description: 'record: deprecated alias of statement; longer observation if it does not fit one line.' },
-      context: { type: 'string', description: 'record: environment that matters (DPI, window state, version).' },
-      cause: { type: 'string', description: 'record/update: suspected cause, marked as suspected.' },
-      workaround: { type: 'string', description: 'record/update: what actually worked.' },
-      outcome: { type: 'string', enum: ['worked', 'partial', 'failed', 'unknown'], description: 'record/update.' },
-      confidence: { type: 'string', enum: ['low', 'medium', 'high'], description: 'record: how sure you are.' },
-      tags: { type: 'array', items: { type: 'string' }, description: 'record: short machine-friendly tags.' },
-      verified: { type: 'json', description: 'update: true when the note proved correct again in this task.' },
-      supersededBy: { type: 'string', description: 'update: id of the note that replaces this one.' },
-      stale: { type: 'boolean', description: 'update: mark the note as no longer applicable.' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render(_args, value) {
-        return [{ type: 'text', text: stringifyCompact(value) }]
-      },
-    },
-    async execute(args) {
-      const input = args && typeof args === 'object' ? args : {}
-      const experience = state.experience
-      const action = String(input.action || 'list').trim().toLowerCase()
-      if (action === 'snapshot') {
-        return {
-          ok: true,
-          action,
-          ...experience.snapshot({
-            preset: state.preset,
-            surfaces: state.surfaces,
-            exposedTools: state.exposedNames,
-          }),
-        }
-      }
-      if (action === 'record') {
-        const scoped = { ...input }
-        if (scoped.scopePresets !== undefined || scoped.scopeApps !== undefined) {
-          scoped.scope = {
-            presets: scoped.scopePresets === undefined ? undefined : scoped.scopePresets,
-            apps: scoped.scopeApps === undefined ? undefined : scoped.scopeApps,
-          }
-        }
-        if (scoped.preset === undefined) scoped.preset = state.preset
-        return { ok: true, action, ...experience.record(scoped) }
-      }
-      if (action === 'update') {
-        const id = String(input.id || '').trim()
-        if (!id) throw new Error('experience: update needs an "id"')
-        return { ok: true, action, ...experience.update(id, input) }
-      }
-      if (action === 'get') {
-        const id = String(input.id || '').trim()
-        if (!id) throw new Error('experience: get needs an "id"')
-        const entry = experience.get(id)
-        if (!entry) throw new Error('experience: no note with id ' + id)
-        return { ok: true, action, entry }
-      }
-      if (action === 'stats') return { ok: true, action, ...experience.stats() }
-      if (action === 'list') return { ok: true, action, ...experience.list(input) }
-      throw new Error('experience: unknown action "' + action + '" (list, get, record, update, stats, snapshot)')
-    },
-    isConcurrencySafe() {
-      return false
-    },
-    presentCall(args) {
-      return {
-        card: 'generic',
-        title: EXPERIENCE_TOOL_NAME,
-        rawInput: args && typeof args === 'object' ? args : {},
-      }
-    },
-  })
-}
-
 
 //: Tools that accept `text` as "the element named X" rather than as a payload.
 //: Mirrors exactly the tools whose schema gets the optional `text` property in
@@ -606,13 +392,7 @@ function makeSidecarTool(ctx, spec, config, state, options) {
     output: {
       schema: OUTPUT_SCHEMA,
       render(_args, value) {
-        // The advisory digest rides as its own text block: the official payload keeps
-        // its exact key set (AX-15/TC-09 gate get_window_state to exactly
-        // accessibility/cacheDiagnostics/screenshots/window).
-        const blocks = []
-        const digest = value && typeof value === 'object' ? value.experience : undefined
-        if (digest) blocks.push({ type: 'text', text: formatDigest(digest) })
-        return blocks.concat(renderValue(value))
+        return renderValue(value)
       },
     },
     async execute(args, exec) {
@@ -700,19 +480,14 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         if (!result?.ok && result?.error) throw new Error(String(result.error))
         result = deriveAudioResult(result, spec.name)
       } catch (error) {
-        // The failure is a fact worth keeping: it is what makes the pending queue and
-        // the "nobody wrote this up" reminder possible.
-        recordCall(state, spec.name, input, turnMeta, startedAt, undefined, error)
         throw error
       }
       const value = result?.value ?? result
       if (spec.name === 'get_window_state' && value?.accessibility?.tree) {
         state.lastElements = extractInteractiveElements(value.accessibility.tree)
       }
-      recordCall(state, spec.name, input, turnMeta, startedAt, value)
       const refs = await admitImages(ctx, result?.images || [])
-      const digest = digestForCall(state, spec.name, turnMeta, value)
-      return digest ? { value, images: refs, experience: digest } : { value, images: refs }
+      return { value, images: refs }
     },
     isConcurrencySafe() {
       return false
