@@ -221,18 +221,7 @@ test('EXP-6 the tool plane injects the digest as its own block and never touches
     const args = { window: { app: 'blender.exe', id: 1 }, include_text: true }
     const annotated = await tool.execute(args, EXEC)
     assert.deepEqual(annotated.value, { ...WINDOW, window: { app: 'blender.exe', id: 1 } }, 'the official payload is byte-identical')
-    assert.ok(annotated.experience, 'the digest rides beside the payload')
-    const blocks = tool.output.render(args, annotated)
-    assert.equal(blocks[0].type, 'text')
-    assert.match(blocks[0].text, /Experience notes for blender\.exe/)
-    assert.match(blocks[0].text, /ADVISORY ONLY/)
-    assert.match(blocks[1].text, /"cacheDiagnostics"/, 'the payload block is unchanged and still follows')
-
-    const again = await tool.execute(args, EXEC)
-    assert.equal(again.experience, undefined, 'the digest is injected once per turn and app')
-
-    const otherSession = await tool.execute(args, { agent: { id: 'session-other' }, callId: 'call-2' })
-    assert.ok(otherSession.experience, 'another conversation gets its own digest')
+    assert.equal(annotated.experience, undefined, 'digest injection is retired and never injected')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -246,9 +235,7 @@ test('EXP-7 a disabled layer writes nothing and injects nothing', async () => {
     const tool = harness.registered.get('get_window_state')
     const result = await tool.execute({ window: { app: 'blender.exe', id: 1 } }, EXEC)
     assert.equal(result.experience, undefined)
-    const experienceTool = harness.registered.get(EXPERIENCE_TOOL_NAME)
-    assert.equal(experienceTool.name, 'computer_use_experience')
-    await assert.rejects(() => experienceTool.execute({ action: 'record', app: 'blender.exe', symptom: 's', cause: 'c' }), /disabled/)
+    assert.equal(harness.registered.has(EXPERIENCE_TOOL_NAME), false, 'experience tool is retired and never registered')
     assert.deepEqual(fs.readdirSync(dir), [], 'a disabled layer leaves the store empty')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -358,25 +345,16 @@ test('EXP-11 the always-on header and its skill copy stay byte-identical', () =>
   const assets = fs.readFileSync(path.join(pluginRoot, 'helper-rs', 'assets', 'prompts', 'dsh-header.md'), 'utf8')
   const reference = fs.readFileSync(path.join(pluginRoot, 'skills', 'computer-use', 'references', 'dsh-header.md'), 'utf8')
   assert.equal(reference, assets)
-  assert.match(assets, /computer_use_experience/, 'the always-on section points at the experience layer')
-  assert.match(fs.readFileSync(path.join(pluginRoot, 'skills', 'computer-use', 'SKILL.md'), 'utf8'), /## Experience notes \(advisory\)/)
+  assert.equal(assets.includes('computer_use_experience'), false, 'experience tool is retired from always-on header')
+  assert.equal(fs.readFileSync(path.join(pluginRoot, 'skills', 'computer-use', 'SKILL.md'), 'utf8').includes('computer_use_experience'), false, 'experience tool is retired from skill')
 })
 
-test('EXP-12 the experience tool reaches the registry with a compiled parameter schema', async () => {
+test('EXP-12 the experience tool is retired and never registered in the tool plane', async () => {
   const { dir, store } = tempStore()
   try {
     const harness = makeHarness({ experience: store })
     await applyTools(harness.ctx, ToolConfig({}))
-    const tool = harness.registered.get(EXPERIENCE_TOOL_NAME)
-    assert.ok(tool, 'the experience tool is registered next to the desktop tools')
-    assert.equal(tool.parameters.type, 'object')
-    assert.deepEqual(tool.parameters.properties.action.enum, ['list', 'get', 'record', 'update', 'stats', 'snapshot'])
-    assert.equal(tool.parameters.properties.tags.type, 'array')
-    assert.equal(tool.parameters.properties.stale.type, 'boolean')
-    assert.equal(tool.parameters.properties.scopePresets.type, 'array', 'V2: the record carries an explicit audience')
-    assert.deepEqual(tool.parameters.properties.volatility.enum, ['durable', 'until-config-change', 'until-date'])
-    assert.match(tool.description, /ADVISORY only/)
-    assert.match(tool.description, /snapshot/, 'V3: state questions point at the live snapshot action')
+    assert.equal(harness.registered.has(EXPERIENCE_TOOL_NAME), false, 'computer_use_experience is completely retired from tools')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

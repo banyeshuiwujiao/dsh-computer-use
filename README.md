@@ -187,8 +187,7 @@ flowchart TB
 | Tool | Default | Purpose |
 |---|---|---|
 | `batch_actions` | enabled | Deterministic actions in one call, then one `get_window_state` |
-| `computer_use_health` | always | Backend, allow list, documentation gate, environment audit, experience store |
-| `computer_use_experience` | always | Read, record and update the local experience notes |
+| `computer_use_health` | always | Backend, allow list, documentation gate, environment audit |
 | `click_element`, `scroll_element` | opt-in | Legacy window-v1 aliases |
 | `session_note`, `session_state`, `diagnostic_state`, `end_turn` | diagnostic | Session scratchpad, state dump and turn control |
 
@@ -420,7 +419,7 @@ docs/                   plugin readmes and assets
 | The status pill never appears | Read `computer_use_health` → `overlay.captureExclusion`. The default `mask` always keeps the pill on screen. The official-style `wda` affinity stops the DWM from presenting the pill's composition content *on screen* on some Windows/DWM/GPU combinations (the operator then sees the synthetic cursor and no pill, while every overlay API still reports `visible=true`); that is why it is opt-in. A stuck mask would show up as `overlay.captureMasked = true`, and the helper lifts one itself after five seconds. |
 | `list_apps` times out | The installed-app catalog is the one method that does real work before answering. `computer_use_health` → `overlay`/`appCatalog` timing and the helper's own `%LOCALAPPDATA%\computer-use-app-catalog\slow-requests.log` (every request over `DSH_CU_SLOW_REQUEST_MS`, default 1 s, with catalog and rebuild-stage timing) are the two records that survive: a transport timeout kills the helper, so its in-process diagnostics are gone by the time you can ask. Raise `listAppsTimeoutMs` if the catalog is genuinely slow on the machine |
 | `Computer Use was stopped by the user with the physical Escape key` without pressing Esc | A tool call was aborted by the harness (its own budget) and the helper latched the turn as stopped. Aborts now send `cancel`, which only drops the overlay; if you still see this, the helper is from an older build (a fresh helper starts on the next turn) |
-| An app has an unusable accessibility tree | Common for self-drawn UIs. Use the screenshot path, or prefer the app own scripting interface, then record what you learned with `computer_use_experience`. |
+| An app has an unusable accessibility tree | Common for self-drawn UIs. Use the screenshot path, or prefer the app own scripting interface, then document what you learned in a dedicated Skill. |
 
 ---
 

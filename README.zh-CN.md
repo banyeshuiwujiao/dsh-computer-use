@@ -187,8 +187,7 @@ flowchart TB
 | 工具 | 默认 | 用途 |
 |---|---|---|
 | `batch_actions` | 开启 | 一次调用执行一串确定性动作，然后做一次 `get_window_state` |
-| `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计、经验层状态 |
-| `computer_use_experience` | 始终 | 读取、记录与更新本机经验笔记 |
+| `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计 |
 | `click_element`、`scroll_element` | 需显式开启 | 旧版 window-v1 别名 |
 | `session_note`、`session_state`、`diagnostic_state`、`end_turn` | 诊断 | 会话草稿、状态转储与回合控制 |
 

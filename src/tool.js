@@ -251,7 +251,6 @@ async function registerDesktop(ctx, state, config) {
     desktops = Array.isArray(listed?.tools) ? listed.tools.filter(spec => spec?.name) : []
   } catch (error) {
     ctx.tools.register(healthTool(ctx, state, config, String(error)))
-    registerExperienceTool(ctx, state)
     return
   }
   // Harness extensions are requested as their own surface (TC-01). A helper
@@ -272,7 +271,6 @@ async function registerDesktop(ctx, state, config) {
   const enabled = new Set(config.enabledTools || [])
   const extras = harness.filter(spec => enabled.has(spec.name))
   ctx.tools.register(healthTool(ctx, state, config))
-  registerExperienceTool(ctx, state)
   const exposed = desktops.concat(extras)
   for (const spec of exposed) {
     try {
@@ -339,9 +337,8 @@ function healthTool(ctx, state, config, startError) {
         },
         documentation: documentationSummary(),
         promptAssets: promptAssetStatus(),
-        // DSH extension, not official: the local experience layer, its store path and
-        // what it currently holds. Notes are advisory; nothing here gates a call.
-        experience: experienceStats(state),
+        // 经验层已彻底下线（统一维护在受控 Skills 中）：
+        experience: { enabled: false, retired: true },
         documentationGate: {
           requiredFor: REQUIRED_DOCS,
           unshipped: UNSHIPPED_REQUIRED_DOCS,
@@ -414,26 +411,8 @@ function recordCall(state, method, input, turnMeta, startedAt, value, error) {
   }
 }
 
-/** The advisory digest, at most once per turn and app. */
+/** The advisory digest has been retired: returns null to never inject stale notes. */
 function digestForCall(state, method, turnMeta, value) {
-  const experience = state.experience
-  if (!experience || typeof experience.digest !== 'function') return null
-  if (!isDigestMethod(method)) return null
-  try {
-    const turnKey = turnKeyOf(turnMeta)
-    for (const app of appsInResult(method, value)) {
-      const key = appKeyOf(app)
-      if (!key) continue
-      const memo = turnKey + '\u0000' + key
-      if (state.digested.has(memo)) continue
-      state.digested.add(memo)
-      if (state.digested.size > 256) state.digested.clear()
-      const digest = experience.digest(key, app, { preset: state.preset })
-      if (digest) return digest
-    }
-  } catch {
-    return null
-  }
   return null
 }
 
