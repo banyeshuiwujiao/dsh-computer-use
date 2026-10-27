@@ -256,6 +256,24 @@ async function registerDesktop(ctx, state, config) {
     }
   }
   state.exposedNames = exposed.map(spec => spec.name)
+  publishToolNames(ctx, state)
+}
+
+/**
+ * Tell the safety contract which tool schemas belong to this plugin.
+ *
+ * The contract hides them from a session whose capability is off (SEC-02), so it
+ * needs the exact set of names — the list grows when the browser catalog is
+ * unlocked, which is why it is published again from there.
+ *
+ * @param {object} ctx
+ * @param {{ exposedNames: string[] }} state
+ */
+function publishToolNames(ctx, state) {
+  const safety = ctx.dshComputerUse?.safety
+  if (safety && typeof safety.setToolNames === 'function') {
+    safety.setToolNames(state.exposedNames)
+  }
 }
 
 async function unlockBrowserTools(ctx, state, config) {
@@ -273,10 +291,12 @@ async function unlockBrowserTools(ctx, state, config) {
     if (!spec?.name) continue
     try {
       ctx.tools.register(makeSidecarTool(ctx, spec, config, state, { descriptionPrefix: BROWSER_ENTRY_GUIDANCE }))
+      state.exposedNames = [...state.exposedNames, spec.name]
     } catch (error) {
       console.error(`[dsh-computer-use] skipped tool ${spec.name}: ${error}`)
     }
   }
+  publishToolNames(ctx, state)
   try {
     await ctx.dshComputerUse.call('browser_setup', { environment: 'codex-app' })
   } catch (error) {
@@ -303,6 +323,11 @@ function healthTool(ctx, state, config, startError) {
         browserUnlocked: Boolean(state.browserUnlocked),
         browserSkill: BROWSER_SKILL,
         tools: { exposed: state.exposedNames, enabled: config.enabledTools },
+        // The safety contract, seen from the calling session: may it drive the
+        // desktop, does it hold the write lease, and are its tool schemas
+        // currently hidden. This is the audit surface for "why was that
+        // refused" — the answer belongs next to the health facts.
+        safety: ctx.dshComputerUse?.safetyState?.(exec?.agent?.session?.id ?? exec?.agent?.id),
         approval: {
           default: config.approvalDefault,
           tools: config.approvalTools,
@@ -391,6 +416,13 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       },
     },
     async execute(args, exec) {
+      // The safety contract runs **first**, before argument validation: a
+      // capability that is off has to report the same actionable message no
+      // matter what the model passed. It also decides whether this call moves
+      // the desktop, which is exactly what the cross-session write lease
+      // arbitrates (read operations are never arbitrated).
+      const safety = ctx.dshComputerUse?.safety
+      const gate = safety ? safety.gate(exec, spec.name) : null
       const input = args && typeof args === 'object' ? { ...args } : {}
       // set_value takes the value in `value`; `text` is only the element selector.
       // Writing the value into `text` reaches the helper as a missing `value` and
@@ -470,17 +502,30 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         }
       }
       const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
-      const startedAt = Date.now()
       // Audit P3-3: the try/catch here used to rethrow unchanged — a dead
       // remnant of the removed recordCall hook — so the bare try is gone too.
-      let result = await ctx.dshComputerUse.call(spec.name, input, exec.signal, turnMeta)
-      if (result && result.approvalRequest) {
-        const refusal = normalizeApprovalRequest(result.approvalRequest)
-        // Official helper_transport.js only treats the payload as an approval when
-        // "app" is a non-empty string after trimming; otherwise the helper returned
-        // an ordinary error and this is not an approval flow (APS-10).
-        if (refusal) result = await resolveRefusal(ctx, config, state, spec, exec, input, turnMeta, refusal)
+      // (`startedAt` went with it: the removed hook was its only reader.)
+      //
+      // The write lease is held for the **whole** mutating region, including the
+      // approval retry: the retry is a second desktop mutation, and a lease that
+      // was released between the two would let another session take the desktop
+      // in the middle of this one. The idle clock restarts when the write
+      // *finishes*, not when it was accepted.
+      let result
+      if (gate?.write) safety.beginWrite()
+      try {
+        result = await ctx.dshComputerUse.call(spec.name, input, exec.signal, turnMeta)
+        if (result && result.approvalRequest) {
+          const refusal = normalizeApprovalRequest(result.approvalRequest)
+          // Official helper_transport.js only treats the payload as an approval when
+          // "app" is a non-empty string after trimming; otherwise the helper returned
+          // an ordinary error and this is not an approval flow (APS-10).
+          if (refusal) result = await resolveRefusal(ctx, config, state, spec, exec, input, turnMeta, refusal)
+        }
+      } finally {
+        if (gate?.write) safety.finishWrite()
       }
+      if (gate?.write) safety.lease.note(gate.sessionId, spec.name)
       if (!result?.ok && result?.error) throw new Error(String(result.error))
       result = deriveAudioResult(result, spec.name)
       const value = result?.value ?? result

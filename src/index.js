@@ -11,6 +11,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { Sidecar, BASE_ENV_ALLOWLIST } from './sidecar.js'
 import { defaultEngineRoot } from './paths.js'
 import { documentationSummary, promptAssetStatus } from './prompt.js'
+import { createSafetyContract } from './safety/index.js'
 
 /**
  * Declarative turn-lifecycle hooks (PKG-04).
@@ -158,6 +159,52 @@ export const Config = Schema.object({
   preserveHelperOnTimeout: Schema.boolean().default(false),
   allowedApps: Schema.array(Schema.string()).default([]),
   /**
+   * Safety contract: whether the capability is on for a session that was never
+   * explicitly granted or revoked.
+   *
+   * DSH extension, and the one place this plugin deliberately differs from the
+   * reference design (`git-repo/dsh-computer-use`, "默认关闭"): that project ships a
+   * client row with a 「电脑操作」 chip in the composer toolbar, so "off by default"
+   * costs the user one click. This plugin has **no client row**, so "off by
+   * default" would mean "no feature". The per-session semantics are unchanged —
+   * `grant`/`revoke` exist and the schema is hidden while a session is off — only
+   * the deployment-wide fallback differs.
+   */
+  safetyDefaultEnabled: Schema.boolean().default(true),
+  /**
+   * Safety contract: refuse computer control to delegated subagents.
+   *
+   * A subagent's permission scope is fixed when it starts and cannot be widened
+   * from inside the session, so a capability that moves the mouse and keyboard
+   * must not be reachable by a child. The refusal names the way out ("hand this
+   * step back to the parent") instead of just denying.
+   */
+  safetyDenySubagents: Schema.boolean().default(true),
+  /**
+   * Safety contract: hide the tool schemas of a session whose capability is off.
+   *
+   * A registered tool's schema rides along with every request of its session, so
+   * a tool this session may never call is pure overhead. Turning the capability
+   * off then costs the session nothing.
+   */
+  safetyHideToolSchemasWhenOff: Schema.boolean().default(true),
+  /**
+   * Safety contract: arbitrate write operations between sessions.
+   *
+   * The helper is process-wide, so every session shares one mouse and one
+   * keyboard. Two sessions driving it at once interleave into a state neither can
+   * explain — and it cannot be attributed afterwards. Read operations are never
+   * arbitrated.
+   */
+  safetyControllerLease: Schema.boolean().default(true),
+  /**
+   * Safety contract: how long the write lease survives without a write, in ms.
+   *
+   * The idle clock restarts when a write *finishes*, not when it is accepted, so
+   * "quiet for N seconds" really means the desktop was quiet for N seconds.
+   */
+  safetyControllerLeaseIdleMs: Schema.number().default(10000),
+  /**
    * Server-level instruction (official `resources/server-instructions.md`,
    * 86 B, injected through `NODE_REPL_TOOL_OVERRIDES`). Surfaced through
    * `computer_use_health` because DSH has no MCP server header (MCP-02).
@@ -200,12 +247,45 @@ export default class ComputerUseService extends Service {
       envAllowlist: [],
       preserveHelperOnTimeout: false,
       allowedApps: [],
+      safetyDefaultEnabled: true,
+      safetyDenySubagents: true,
+      safetyHideToolSchemasWhenOff: true,
+      safetyControllerLease: true,
+      safetyControllerLeaseIdleMs: 10000,
       serverInstructions:
         'UI automation through the DeepSeek Harness Computer Use tools using the initialized session. Codex is not required.',
       ...config,
     }
     this.sidecar = new Sidecar(this.config)
     this.approved = new Set()
+    /**
+     * The safety contract (SEC-01..SEC-03): the per-session capability grant,
+     * the cross-session write lease, and the schema visibility that keeps a
+     * switched-off session from paying for tool schemas it may never call.
+     *
+     * It lives on the **host plane** for two reasons:
+     *
+     * - it is process-wide state (one helper, one mouse), so it must not be
+     *   per-preset; and
+     * - the preset row cannot observe `session/event` (it lives in a descendant
+     *   scope, and scope-filtered dispatch never reaches a descendant listener),
+     *   so every session-lifecycle hook has to be owned here.
+     *
+     * The contract exposes exactly one entry point for the tool row: `gate()`.
+     */
+    this.safety = createSafetyContract({
+      config: {
+        defaultEnabled: this.config.safetyDefaultEnabled,
+        denySubagents: this.config.safetyDenySubagents,
+        hideToolSchemasWhenOff: this.config.safetyHideToolSchemasWhenOff,
+        controllerLease: this.config.safetyControllerLease,
+        controllerLeaseIdleMs: this.config.safetyControllerLeaseIdleMs,
+      },
+      logger: ctx.logger,
+      supported: process.platform === 'win32',
+      unsupportedReason:
+        `电脑操作目前只实现了 Windows（SendInput + GDI + UI Automation），当前平台是 ${process.platform}。`,
+    })
     /**
      * Turn id per conversation, taken from the session events (`turn/start` /
      * `turn/end`). Tool calls must stamp THIS into their meta, never their own call id:
@@ -264,12 +344,33 @@ export default class ComputerUseService extends Service {
     ctx.on('session/disposed', session => {
       const id = session?.id === undefined || session?.id === null ? null : String(session.id)
       if (id !== null) this.activeConversations.delete(id)
+      // The safety contract is released **before** the overlay ownership check:
+      // a session that does not own the overlay may still own a capability
+      // grant, a write lease or a schema restriction, and those must not outlive
+      // the session that took them.
+      if (id !== null) this.safety.forgetSession(id)
       if (!this.ownsOverlay(session)) return
       this.lastConversationId = null
       this.endTurn({ session_id: id === undefined ? undefined : id }).catch(() => {})
       this.releaseOverlay().catch(() => {})
     })
     ctx.effect(() => () => this.sidecar.dispose(), 'computer-use sidecar')
+    // Plugin unload: every schema restriction this plugin applied goes away.
+    // A restriction that outlives the plugin would keep a tool invisible to a
+    // session whose capability was turned back on.
+    ctx.effect(() => () => this.safety.releaseAll(), 'computer-use safety release')
+    // Agent lifecycle: keep the schema visibility aligned with the capability.
+    //
+    // These live on the host plane for the same reason the session hooks do —
+    // the preset row cannot observe agent events. `remember` is idempotent and
+    // registers the agent on contact, so a session that existed before this
+    // plugin was mounted still converges on its next tool call.
+    ctx.on('agent/created', payload => {
+      this.safety.visibility.remember(payload?.agent)
+    })
+    ctx.on('agent/disposed', payload => {
+      this.safety.visibility.forget(payload?.agent)
+    })
   }
 
   /**
@@ -305,6 +406,9 @@ export default class ComputerUseService extends Service {
       // grow with the tool catalog.
       serverInstructions: this.config.serverInstructions,
       capabilities: SERVICE_CAPABILITIES,
+      // Safety contract: the auditable answer to "may this session drive the
+      // desktop, and what does it cost". Reported per session when one is known.
+      safety: this.safety.report(undefined),
       // DSH extension, not official: surfaced so the token-cost trade-off is
       // visible and auditable instead of hidden in the config.
       captureLimits: captureLimits(this.config.maxImageEdge, this.config.engineRoot),
@@ -324,6 +428,17 @@ export default class ComputerUseService extends Service {
    */
   tools(surface) {
     return this.sidecar.request('tools', { surface: surface || this.config.surface })
+  }
+
+  /**
+   * The safety state of one session: may it drive the desktop, does it hold the
+   * write lease, and are its tool schemas currently hidden.
+   *
+   * @param {unknown} [sessionId]
+   * @returns {object}
+   */
+  safetyState(sessionId) {
+    return this.safety.report(sessionId)
   }
 
   /**

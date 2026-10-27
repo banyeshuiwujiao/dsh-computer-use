@@ -14,6 +14,7 @@ from computer_use.cdp_ax import ax_text, flatten_cdp_ax
 from computer_use.cdp_http import list_tabs
 from computer_use.cdp_ws import CdpConn
 from computer_use.compact import tree_diff
+from computer_use.temp_janitor import janitor
 
 
 @dataclass
@@ -262,6 +263,10 @@ class CdpBrowser:
             except RuntimeError:
                 pass
             tab.conn.close()
+        # The tab's plugin-generated exports and media captures go with it
+        # (SEC-05). A *download* is the user's artifact and is not ours to
+        # delete, so it was never registered with the janitor.
+        janitor.release_owner(str(tab_id))
         return {"ok": True, "closed": tab_id}
 
     def get_js_dialog(self, tab_id: str) -> dict[str, object] | None:
@@ -434,6 +439,10 @@ class CdpBrowser:
         import tempfile
         from pathlib import Path
 
+        # NOT janitor-owned: a download is the **user's** artifact, not a plugin
+        # intermediate. The model gets the path back and may copy the file out,
+        # so it must survive the tab and the sidecar. (SEC-05's exemption rule:
+        # a file the caller was pointed at is not ours to delete.)
         dest = Path(getattr(tab, "_download_dir", "") or tempfile.mkdtemp())
         dest.mkdir(parents=True, exist_ok=True)
         tab._download_dir = dest  # type: ignore[attr-defined]
@@ -506,7 +515,7 @@ class CdpBrowser:
         raw = base64.b64decode(str(fetched.get("b64") or "")) if fetched.get("b64") else b""
         if not raw:
             raw = b"cdp-download"
-        path = Path(tempfile.gettempdir()) / f"cdp-media-{tab.id}.bin"
+        path = janitor.new_path(f"cdp-media-{tab.id}.bin", owner=str(tab.id))
         path.write_bytes(raw)
         item = {
             "filename": path.name,
@@ -553,6 +562,11 @@ class CdpBrowser:
         from computer_use.audio_win import start_recording
 
         path = Path(tempfile.gettempdir()) / "computer-audio.wav"
+        # The recording is a user artifact that would otherwise stay in the
+        # system temp dir forever. Register it so the janitor takes it away when
+        # the sidecar exits; the path itself is unchanged, so the stop half of
+        # this flow still finds it.
+        janitor.track(path)
         handle, backend = start_recording(path)
         self._audio_handle = handle
         self._audio_path = path
@@ -633,14 +647,14 @@ class CdpBrowser:
                     fetched = self._eval(tab_id, f"({FETCH_AS_B64_JS})({json.dumps(track_url)})", await_promise=True) or {}
                     xml = base64.b64decode(str(fetched.get("b64") or "")).decode("utf-8", errors="ignore")
                     text = parse_timedtext_xml(xml)
-            path = Path(tempfile.gettempdir()) / f"yt-{tab.id}.txt"
+            path = janitor.new_path(f"yt-{tab.id}.txt", owner=str(tab.id))
             path.write_text(text, encoding="utf-8")
             return {"path": str(path), "bytes": path.stat().st_size, "tracks": len(tracks), "backend": "cdp-timedtext" if tracks else "cdp-login"}
         fmt = str(spec.get("type") or "pdf")
         export_url = gsuite_export_url(tab.url, fmt)
         if not export_url:
             text = self.inner_text(tab_id)
-            path = Path(tempfile.gettempdir()) / f"export-{tab.id}.txt"
+            path = janitor.new_path(f"export-{tab.id}.txt", owner=str(tab.id))
             path.write_text(text, encoding="utf-8")
             return {"path": str(path), "bytes": path.stat().st_size, "backend": "cdp-text"}
         fetched = self._eval(tab_id, f"({FETCH_AS_B64_JS})({json.dumps(export_url)})", await_promise=True) or {}
@@ -656,20 +670,19 @@ class CdpBrowser:
                 "loginRequired": True,
                 "backend": "gsuite-login-wall",
             }
-        path = Path(tempfile.gettempdir()) / f"gsuite-{tab.id}.{fmt}"
+        path = janitor.new_path(f"gsuite-{tab.id}.{fmt}", owner=str(tab.id))
         path.write_bytes(raw)
         return {"path": str(path), "bytes": len(raw), "exportUrl": export_url, "status": fetched.get("status"), "loginRequired": False, "backend": "cdp-login"}
 
     def page_assets_bundle(self, tab_id: str, inventory_id: str = "") -> dict[str, object]:
         import base64
         import json as json_lib
-        import tempfile
         from pathlib import Path
 
         from computer_use.browser_export import FETCH_AS_B64_JS
 
         inventory = self.page_assets_list(tab_id)
-        directory = Path(tempfile.mkdtemp())
+        directory = janitor.new_dir("assets", owner=str(tab.id))
         saved = []
         failures = []
         for asset in inventory.get("assets") or []:

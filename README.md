@@ -231,6 +231,27 @@ The plugin ships the official confirmation policy and a hard deny list, and the 
 
 Read the shipped policy before extending the tool surface: `skills/computer-use/references/confirmations.md` and `skills/computer-use-browser/references/confirmations.md`.
 
+### The safety contract (`src/safety/`)
+
+Four rules decide whether a call may touch the desktop. They live in `src/safety/`, which has
+**no host dependency** on purpose: a policy layer that can only be exercised inside a full host
+is a policy layer nobody re-tests.
+
+| Rule | What it does |
+|---|---|
+| **Per-session grant** | The capability is off for a session that was never granted it. A grant cannot be widened from inside the session, and a delegated subagent is refused outright (`SUBAGENT_COMPUTER_USE_UNAVAILABLE`) — hand that step back to the parent |
+| **Schema visibility** | While a session's capability is off, its tool schemas are removed from that agent's view, so the session does not pay for tools it may never call. The restriction is released through the disposer **function** the host returns — `restricted.dispose?.()` would be a silent no-op and the tool would stay invisible forever |
+| **Cross-session write lease** | The helper is process-wide, so every session shares one mouse. A write operation holds the lease while it runs; the idle clock restarts when the write *finishes*. Read operations are never arbitrated, and the refusal says whether the other session is *executing* or merely *quiet* |
+| **Structured failures** | Every refusal carries a stable `code`, a `retry` verdict (`never` / `retry` / `reobserve`) and the next step to take. "It failed" and "it failed, observe again first" call for opposite reactions |
+
+Two layers below the plugin already cover the rest of the contract and are **not** re-implemented here:
+the Rust helper refuses input on a locked desktop (`helper-rs/src/desktop.rs`) and reports an
+integrity-limited target (`helper-rs/src/uia.rs`), while the plugin itself never writes screenshot
+files to disk — the bytes go to the host's attachment store, so their lifetime is the host's business.
+
+The design notes, the gap analysis against the reference implementation and the port's own
+findings live in [`docs/design-essence-dsh-computer-use.md`](docs/design-essence-dsh-computer-use.md).
+
 ---
 
 ---
@@ -252,6 +273,11 @@ Read the shipped policy before extending the tool surface: `skills/computer-use/
 | `allowedApps` | `[]` | Non-empty means only these app ids may be observed or driven |
 | `envAllowlist` | `[]` | Extra environment names forwarded to the helper on top of the shipped allow list |
 | `overlayCaptureExclusion` | `mask` | How the status pill is kept out of the model's screenshots: `mask` hides it in the compositor for the duration of one capture (you keep seeing it), `wda` applies `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` instead, `off` leaves the pill in the frame |
+| `safetyDefaultEnabled` | `true` | Whether the capability is on for a session that was never explicitly granted or revoked. `false` closes it by default and hides its tool schemas |
+| `safetyDenySubagents` | `true` | Refuse computer control to delegated subagents: a subagent's scope is fixed when it starts and cannot be widened from inside the session |
+| `safetyHideToolSchemasWhenOff` | `true` | Hide the tool schemas of a session whose capability is off (a registered tool's schema rides along with every request) |
+| `safetyControllerLease` | `true` | Arbitrate write operations between sessions: the helper is process-wide, so every session shares one mouse and one keyboard |
+| `safetyControllerLeaseIdleMs` | `10000` | How long the write lease survives without a write. The idle clock restarts when a write *finishes*, not when it is accepted |
 
 ### PRESET plane (the `dsh-computer-use/tool` row)
 
@@ -338,6 +364,11 @@ src/
   sidecar.js            helper transport: spawn, JSON-RPC, budgets, routing
   prompt.js             always-on prompt section + on-demand reference inventory
   paths.js              helper/python discovery
+  safety/               the safety contract (no host dependency, unit-tested standalone)
+    grant.js            per-session capability grant + subagent refusal
+    schema-visibility.js  hiding a switched-off session's tool schemas
+    controller-lease.js   cross-session write arbitration
+    failures.js         code + retry + next step for every refusal
 skills/
   computer-use/         the desktop skill + its reference documents
   computer-use-browser/ the browser skill + its reference documents

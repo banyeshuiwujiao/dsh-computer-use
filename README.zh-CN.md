@@ -231,6 +231,26 @@ sequenceDiagram
 
 扩展工具面之前，先读随包的策略文档：`skills/computer-use/references/confirmations.md` 与 `skills/computer-use-browser/references/confirmations.md`。
 
+### 安全契约（`src/safety/`）
+
+四条规则决定一次调用能不能碰桌面。它们住在 `src/safety/`，**刻意不依赖任何宿主包**——
+一个只能在整个宿主里跑起来的策略层，没有人会反复测试。
+
+| 规则 | 做什么 |
+|---|---|
+| **按会话授权** | 从未被显式授权的会话，能力是关着的。授权**不能从会话内部放宽**；被委派的子代理一律拒绝（`SUBAGENT_COMPUTER_USE_UNAVAILABLE`），并被告知「把这一步交回主代理」 |
+| **schema 可见性** | 会话能力关着时，把它的工具 schema 从该 agent 的视野里摘掉，这个会话就不必为用不了的工具付费。释放必须走宿主返回的**函数**式 disposer——`restricted.dispose?.()` 是静默空操作，工具会永远不出现 |
+| **跨会话写租约** | helper 是进程级的，所有会话共用同一只鼠标。写操作在执行期间持有租约，**空闲时钟从写完那一刻重新开始**。读操作永不参与仲裁；拒绝消息会说明对方是「正在执行」还是「安静了 N 秒」 |
+| **失败结构化** | 每条拒绝都带稳定的 `code`、`retry` 判据（`never` / `retry` / `reobserve`）与「下一步做什么」。「它失败了」和「它失败了，先重新观察」需要相反的反应 |
+
+契约里另外两条由更低层覆盖，本次**没有重复实现**：Rust helper 在锁屏时拒绝输入
+（`helper-rs/src/desktop.rs`）、对更高完整性级别的目标给出完整性受限说明
+（`helper-rs/src/uia.rs`）；而插件**从不把截图写到自己磁盘上**——字节交给宿主的 attachment store，
+文件生命周期归宿主。
+
+设计笔记、与参考实现的差距分析、以及移植过程中自己发现并修正的三个问题，见
+[`docs/design-essence-dsh-computer-use.md`](docs/design-essence-dsh-computer-use.md)。
+
 ---
 
 ## 配置
@@ -250,6 +270,11 @@ sequenceDiagram
 | `allowedApps` | `[]` | 非空时只有这些 app id 可被观察或驱动 |
 | `envAllowlist` | `[]` | 在随包允许列表之外额外转发给 helper 的环境变量名 |
 | `overlayCaptureExclusion` | `mask` | 状态药丸如何避开模型看到的截图：`mask`（默认）在单次捕获期间用合成器隐藏药丸，操作者始终能看到；`wda` 改用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`；`off` 不排除，药丸会出现在截图里 |
+| `safetyDefaultEnabled` | `true` | 从未被显式授权或收回的会话，能力默认是否开启。`false` 则默认关闭并摘掉它的工具 schema |
+| `safetyDenySubagents` | `true` | 是否一律拒绝子代理驱动桌面：子代理的权限范围在启动时就固定，不能从会话内部放宽 |
+| `safetyHideToolSchemasWhenOff` | `true` | 能力关闭时是否摘掉工具 schema（已注册工具的 schema 随该会话的每个请求一起发出去） |
+| `safetyControllerLease` | `true` | 是否在会话之间仲裁写操作：helper 是进程级的，所有会话共用同一只鼠标和键盘 |
+| `safetyControllerLeaseIdleMs` | `10000` | 写租约在没有写操作时存活多久。空闲时钟从写**结束**那一刻重新开始，而不是从被接受那一刻 |
 
 ### PRESET 平面（`dsh-computer-use/tool` 行）
 
