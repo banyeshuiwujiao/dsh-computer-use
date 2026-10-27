@@ -61,6 +61,7 @@ export const DEFAULT_SAFETY_CONFIG = Object.freeze({
  *   lease: object,
  *   visibility: object,
  *   gate: (exec: object, toolName: string) => { sessionId: string, write: boolean },
+ *   authorize: (sessionId: unknown, enabled: boolean) => object,
  *   beginWrite: () => void,
  *   finishWrite: () => void,
  *   controlState: (sessionId: unknown) => object,
@@ -193,6 +194,36 @@ export function createSafetyContract(options = {}) {
     visibility.release(sessionKey(sessionId))
   }
 
+  /**
+   * 一把会话内不可自取的钥匙：从**会话之外**把能力开给一个会话（或关掉）。
+   *
+   * 这是 `grant.grant()` / `grant.revoke()` 的可调用形态——没有它，
+   * `safetyDefaultEnabled: false` 的部署没有任何路径能把会话重新打开。
+   * 「会话内不可自取」由调用方保证：这个方法只该被宿主（用户操作、服务 API）
+   * 调用，不该从工具执行路径里够到。
+   *
+   * @param {unknown} sessionId
+   * @param {boolean} enabled - true = 授权，false = 收回。
+   * @returns {{ sessionId: string, enabled: boolean, explicit: boolean, schemas: string }}
+   */
+  function authorize(sessionId, enabled) {
+    const next = enabled === true
+    if (next) grant.grant(sessionId)
+    else grant.revoke(sessionId)
+    // 授权状态变了，schema 可见性必须立刻跟上：开着就把工具放回来，
+    // 关掉就让这个会话重新为它付 schema 费。找不到活 agent 时就地释放
+    // （`activate`/`deactivate` 的语义），agent 之后出现时 `sync` 会按
+    // 同一个授权值重新算。
+    if (next) visibility.activate(sessionId)
+    else visibility.deactivate(sessionId)
+    return {
+      sessionId: sessionKey(sessionId),
+      enabled: next,
+      explicit: grant.hasExplicit(sessionId),
+      schemas: visibility.state(sessionKey(sessionId)),
+    }
+  }
+
   /** 插件卸载：把还留着的限制全部撤掉。 */
   function releaseAll() {
     visibility.releaseAll()
@@ -204,6 +235,7 @@ export function createSafetyContract(options = {}) {
     lease,
     visibility,
     gate,
+    authorize,
     beginWrite,
     finishWrite,
     controlState,

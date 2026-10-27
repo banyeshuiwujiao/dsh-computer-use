@@ -32,6 +32,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 #: 插件自己拥有的临时根目录。所有插件产出的临时文件都在它下面。
 DEFAULT_ROOT_NAME = "dsh-computer-use"
@@ -98,7 +99,6 @@ class TempJanitor:
         target = Path(path)
         key = str(owner)
         with self._lock:
-            self._seq += 1
             if key:
                 self._by_owner.setdefault(key, set()).add(str(target))
             else:
@@ -108,12 +108,11 @@ class TempJanitor:
     def new_path(self, name: str, owner: str = "") -> Path:
         """在插件自己的根目录下造一个唯一路径，并登记它。
 
-        名字保留可读部分与**扩展名**（``export-tab-3-7.txt``），但带一个单调序号，
-        所以同一归属的多次导出不会互相覆盖——源项目用「按基名前缀扫目录」
-        来收拾派生文件，这里用唯一名字从根上避免那份麻烦。
-
-        扩展名要保住：调用方（模型）会按扩展名判断那是什么文件，
-        所以 ``.txt`` / ``.md`` / ``.bin`` 不能被清洗掉。
+        名字保留可读部分与**扩展名**（``export-tab-3-7.txt``），再带一个
+        随机短后缀。序号只保证**单个实例**内的唯一性——两个挂着不同
+        ``DSH_COMPUTER_USE_TEMP_ROOT`` 的进程各有一个 ``_seq``，都从 1 数起；
+        而扩展名是调用方判断文件类型的依据，所以 ``.txt`` / ``.md`` / ``.bin``
+        不能被清洗掉。
         """
         with self._lock:
             self._seq += 1
@@ -127,7 +126,7 @@ class TempJanitor:
             stem = "artifact"
         directory = self.root / sanitize_owner(owner) if owner else self.root
         directory.mkdir(parents=True, exist_ok=True)
-        filename = f"{stem}-{seq}{('.' + suffix) if suffix else ''}"
+        filename = f"{stem}-{seq}-{uuid4().hex[:8]}{('.' + suffix) if suffix else ''}"
         return self.track(directory / filename, owner)
 
     def new_dir(self, prefix: str = "work", owner: str = "") -> Path:
@@ -137,7 +136,8 @@ class TempJanitor:
             seq = self._seq
         directory = self.root / sanitize_owner(owner) if owner else self.root
         directory.mkdir(parents=True, exist_ok=True)
-        target = directory / f"{_OWNER_SAFE.sub('-', str(prefix or 'work')).strip('-') or 'work'}-{seq}"
+        base = _OWNER_SAFE.sub("-", str(prefix or "work")).strip("-") or "work"
+        target = directory / f"{base}-{seq}-{uuid4().hex[:8]}"
         target.mkdir(parents=True, exist_ok=True)
         return self.track(target, owner)
 

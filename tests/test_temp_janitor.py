@@ -48,6 +48,25 @@ class TempJanitorTests(unittest.TestCase):
         self.assertEqual(first.read_text(encoding="utf-8"), "a")
         self.assertEqual(second.read_text(encoding="utf-8"), "b")
 
+    def test_names_cannot_collide_across_instances_sharing_a_root(self) -> None:
+        # P3-3 regression: the per-instance `_seq` counters both start at 1, so
+        # two TempJanitor instances over the SAME root (two processes must not
+        # share one, but a root is also re-creatable within one process) would
+        # mint identical names without the random suffix. Sequence numbers alone
+        # are only unique within one instance; the uuid suffix covers the rest.
+        twin = TempJanitor(root=self.root)
+        seen = set()
+        for _ in range(32):
+            seen.add(self.janitor.new_path("export.txt", owner="tab-1").name)
+            seen.add(twin.new_path("export.txt", owner="tab-1").name)
+            seen.add(self.janitor.new_dir("assets", owner="tab-1").name)
+            seen.add(twin.new_dir("assets", owner="tab-1").name)
+        self.assertEqual(len(seen), 128)
+        # The extension survives the uniquing: callers type-match on it.
+        export_names = [name for name in seen if name.startswith("export")]
+        self.assertTrue(export_names)
+        self.assertTrue(all(name.endswith(".txt") for name in export_names))
+
     def test_new_dir_lands_inside_the_owned_root(self) -> None:
         directory = self.janitor.new_dir("assets", owner="tab-1")
         self.assertTrue(str(directory).startswith(str(self.root)))

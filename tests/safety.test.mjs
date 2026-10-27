@@ -342,6 +342,74 @@ test('contract: a session end forgets the grant, the lease and the restriction',
   assert.equal(contract.grant.isEnabled('s1'), true, 'a forgotten session falls back to the default')
 })
 
+// ------------------------------------------------------------- authorize() --
+
+test('authorize: the key opens a session a closed default had shut (P3-1)', () => {
+  const contract = createSafetyContract({ config: { defaultEnabled: false }, hideableNames: () => ['click'] })
+  const { agent, calls } = fakeAgent('s1')
+  contract.visibility.sync(agent)
+  assert.equal(contract.controlState('s1').state, 'off', 'precondition: the capability is off')
+  assert.equal(contract.visibility.state('s1'), 'hidden')
+  assert.throws(() => contract.gate({ agent }, 'click'), error => error.code === 'NOT_AUTHORIZED')
+
+  const result = contract.authorize('s1', true)
+  assert.equal(result.enabled, true)
+  assert.equal(result.explicit, true)
+  assert.equal(result.schemas, 'visible')
+  assert.equal(contract.controlState('s1').state, 'observing')
+  assert.equal(calls.lifted, 1, 'the schema restriction is lifted the moment the grant flips')
+  assert.doesNotThrow(() => contract.gate({ agent }, 'click'))
+})
+
+test('authorize: revoke closes a session and re-hides its schemas atomically', () => {
+  const contract = createSafetyContract({ config: { defaultEnabled: true }, hideableNames: () => ['click'] })
+  const { agent, calls } = fakeAgent('s1')
+  contract.visibility.sync(agent)
+  assert.doesNotThrow(() => contract.gate({ agent }, 'click'))
+
+  const result = contract.authorize('s1', false)
+  assert.equal(result.enabled, false)
+  assert.equal(result.explicit, true)
+  assert.equal(result.schemas, 'hidden')
+  assert.equal(contract.visibility.state('s1'), 'hidden')
+  assert.throws(() => contract.gate({ agent }, 'click'), error => error.code === 'NOT_AUTHORIZED')
+  // An explicit revoke must survive a later sync (?? not ||): the session stays
+  // closed even though it is registered and reachable again.
+  contract.visibility.sync(agent)
+  assert.equal(contract.visibility.state('s1'), 'hidden')
+  assert.ok(calls.restricted.length >= 1)
+})
+
+test('authorize: a revoked-then-regranted round trip restores everything', () => {
+  const contract = createSafetyContract({ config: { defaultEnabled: true } })
+  const { agent } = fakeAgent('s1')
+  contract.visibility.sync(agent)
+  contract.authorize('s1', false)
+  assert.throws(() => contract.gate({ agent }, 'click'))
+  contract.authorize('s1', true)
+  assert.doesNotThrow(() => contract.gate({ agent }, 'click'))
+  assert.equal(contract.visibility.state('s1'), 'visible')
+})
+
+test('authorize: the anonymous session is keyable like any other', () => {
+  const contract = createSafetyContract({ config: { defaultEnabled: false } })
+  const result = contract.authorize(undefined, true)
+  assert.equal(result.sessionId, '')
+  assert.equal(result.enabled, true)
+  assert.doesNotThrow(() => contract.gate({ agent: {} }, 'get_window_state'))
+})
+
+test('authorize: works without a live agent (the grant survives, schemas follow later)', () => {
+  const contract = createSafetyContract({ config: { defaultEnabled: false } })
+  // No agent was ever synced: activate() reports 'unbound' but the grant itself
+  // must still be recorded — the gate checks the grant, not the visibility.
+  const result = contract.authorize('ghost', true)
+  assert.equal(result.enabled, true)
+  assert.equal(result.schemas, 'visible')
+  const agent = { session: { id: 'ghost' } }
+  assert.doesNotThrow(() => contract.gate({ agent }, 'click'))
+})
+
 test('contract: the defaults keep the current behaviour of this plugin', () => {
   assert.equal(DEFAULT_SAFETY_CONFIG.defaultEnabled, true)
   assert.equal(DEFAULT_SAFETY_CONFIG.denySubagents, true)

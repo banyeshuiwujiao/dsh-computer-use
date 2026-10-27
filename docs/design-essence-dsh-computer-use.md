@@ -296,6 +296,12 @@ agent 创建时、每次芯片开关、以及**每个工具调用里的授权检
 于是摘除走「整批试 → 失败后逐个试 → 全失败则保持『可见但被拒』」的三级降级，
 而不是去猜一个 scope key。（源项目靠 `scopeOf` 精确过滤，本项目靠**降级**达到同样的安全结果。）
 
+**首次调用的收敛窗口（已知且接受）**：`agent/created` 是串行监听器，早于本插件挂载的
+会话错过那次登记；它的**第一次**工具调用会先看到完整 schema（为此付一次 token）、
+在 gate 拒绝时被 `onNotAuthorized → visibility.sync()` 现场收敛。这是一次性的自愈路径，
+不是缺陷：窗口大小是「每个早于插件挂载的会话各一次调用」，之后该会话的 schema 一直
+与授权状态一致。要零窗口就得让注册顺序可保证，那会把插件变成宿主的核心依赖——不值。
+
 ### 6.3 配置项（新增，均有向后兼容的默认值）
 
 宿主面 `src/index.js` 的 `Config`（扁平键，与本项目既有风格一致）：
@@ -313,7 +319,7 @@ agent 创建时、每次芯片开关、以及**每个工具调用里的授权检
 | 项 | 源项目 | 本项目 | 理由 |
 | --- | --- | --- | --- |
 | 默认是否开启 | **关**（`defaultEnabled === true` 才开） | **开** | 源项目有输入框里的「电脑操作」芯片，点一下就开；本项目**没有前端行**，「默认关闭」等于「默认没有功能」。每会话授权、关掉时摘 schema 的语义完全一致。 |
-| 授权入口 | `POST /computer-use/state` + 芯片 UI | `service.safety.grant.grant(id)` / `.revoke(id)` | 本项目没有 chip UI 与 `/computer-use/*` 路由（那是源项目的宿主面形态）。宿主/预设行可以通过服务 API 逐会话开关。 |
+| 授权入口 | `POST /computer-use/state` + 芯片 UI | `service.safetyGrant(id, enabled)`（装配层叫 `safety.authorize(id, enabled)`） | 本项目没有 chip UI 与 `/computer-use/*` 路由（那是源项目的宿主面形态）。授权翻转与 schema 收敛在同一个调用里完成；宿主/用户从**会话之外**调用，工具执行路径够不到它。（P3-1：之前只有授权表没有钥匙，`safetyDefaultEnabled: false` 的部署没有任何路径能把会话重新打开——本方法补上。） |
 
 ### 6.5 兼容性承诺
 
@@ -360,16 +366,24 @@ agent 创建时、每次芯片开关、以及**每个工具调用里的授权检
 
 ## 8. 验收
 
-* **JS（新增）**：`node --test tests/safety.test.mjs` → **30 passed / 0 failed**。
+* **JS（新增）**：`node --test tests/safety.test.mjs` → **35 passed / 0 failed**。
   覆盖失败分类学、授权表的三态与匿名会话、子代理判定、schema 摘除与释放形态、
   租约仲裁（读不占、写占、同会话重入、空闲释放、「正在执行 vs 安静 N 秒」、
-  空闲时钟从写完那一刻重启）、契约的控制状态与会话结束清理。
+  空闲时钟从写完那一刻重启）、契约的控制状态与会话结束清理，
+  以及审计收尾新增的 `authorize()`（钥匙开/关会话、授权翻转与 schema 收敛同帧、
+  匿名会话可授、无活 agent 时授权仍然成立）。
   这个套件**不依赖任何 `@deepseek-ai/*` 包**——`src/safety/*` 刻意没有宿主依赖，
   所以策略层可以脱离宿主单测。
-* **Python（新增）**：`python -m pytest tests/test_temp_janitor.py` → **16 passed / 0 failed**。
-* **Python（回归）**：`python -m pytest tests -q` → **332 passed / 8 skipped**
-  （改动前是 316 passed / 8 skipped，新增的 16 条就是上面的新套件）。
+* **Python（新增）**：`python -m pytest tests/test_temp_janitor.py` → **17 passed / 0 failed**
+  （含 P3-3 回归：同根双实例 32 轮交叉命名零冲突、扩展名保留）。
+* **Python（回归）**：`python -m pytest tests -q` → **333 passed / 8 skipped**
+  （改动前是 316 passed / 8 skipped，新增的 17 条就是上面的新套件）。
 * **Rust**：不改动 `helper-rs/`，无需重编译。
+* **审计收尾（P3-1..P3-5）**：本节之外，本分支还落了审计指出的五个 P3——
+  P3-1 授权钥匙（`safety.authorize` / `service.safetyGrant`，见 §6.4）、
+  P3-2 CONTROLLER_BUSY 拒绝消息不再指向不存在的「会话内关闭」入口、
+  P3-3 janitor 命名加随机后缀防跨实例冲突、P3-4 `track()` 死自增清理、
+  P3-5 首调用收敛窗口补记（见 §6.2）。
 * **已知环境问题（与本次改动无关）**：`npm run test:js`（既有的
   `tests/contracts.test.mjs` / `tests/interactive_summary.test.mjs`）在本机**改动前就已失败**——
   本仓库的 `node_modules` 是一组指向 DSH checkout 的符号链接，而

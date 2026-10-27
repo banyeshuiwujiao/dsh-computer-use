@@ -442,6 +442,24 @@ export default class ComputerUseService extends Service {
   }
 
   /**
+   * Turn the computer-use capability on or off for one session — from OUTSIDE
+   * the session (a user action, a host API), never from a tool-execution path.
+   *
+   * This is the missing key the P3-1 audit finding named: without it, a
+   * deployment with `safetyDefaultEnabled: false` had no way to open a session
+   * back up (the gate refused, the schemas were hidden, and nothing could lift
+   * either). The grant flip and the schema-visibility convergence happen in one
+   * `authorize()` call, so the tool list can never disagree with the grant.
+   *
+   * @param {unknown} sessionId
+   * @param {boolean} enabled - true = grant, false = revoke.
+   * @returns {object} an audit snapshot of the session's safety state
+   */
+  safetyGrant(sessionId, enabled) {
+    return this.safety.authorize(sessionId, enabled)
+  }
+
+  /**
    * @returns {Promise<{prompt?: string}>}
    */
   prompt() {

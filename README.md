@@ -239,7 +239,7 @@ is a policy layer nobody re-tests.
 
 | Rule | What it does |
 |---|---|
-| **Per-session grant** | The capability is off for a session that was never granted it. A grant cannot be widened from inside the session, and a delegated subagent is refused outright (`SUBAGENT_COMPUTER_USE_UNAVAILABLE`) — hand that step back to the parent |
+| **Per-session grant** | The capability is off for a session that was never granted it. A grant cannot be widened from inside the session, and a delegated subagent is refused outright (`SUBAGENT_COMPUTER_USE_UNAVAILABLE`) — hand that step back to the parent. The host may flip a session's grant from **outside** the session via `service.safetyGrant(sessionId, true\|false)` (the contract's `authorize()`), which also converges that session's schema visibility in the same call |
 | **Schema visibility** | While a session's capability is off, its tool schemas are removed from that agent's view, so the session does not pay for tools it may never call. The restriction is released through the disposer **function** the host returns — `restricted.dispose?.()` would be a silent no-op and the tool would stay invisible forever |
 | **Cross-session write lease** | The helper is process-wide, so every session shares one mouse. A write operation holds the lease while it runs; the idle clock restarts when the write *finishes*. Read operations are never arbitrated, and the refusal says whether the other session is *executing* or merely *quiet* |
 | **Structured failures** | Every refusal carries a stable `code`, a `retry` verdict (`never` / `retry` / `reobserve`) and the next step to take. "It failed" and "it failed, observe again first" call for opposite reactions |
