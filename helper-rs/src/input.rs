@@ -282,8 +282,8 @@ pub fn virtual_abs(x: f64, y: f64, vx: i32, vy: i32, vw: i32, vh: i32) -> (i32, 
     let span_x = (vw - 1).max(1) as f64;
     let span_y = (vh - 1).max(1) as f64;
     (
-        ((x - vx as f64) * 65535.0 / span_x) as i32,
-        ((y - vy as f64) * 65535.0 / span_y) as i32,
+        (((x - vx as f64) * 65535.0 / span_x) as i32).clamp(0, 65535),
+        (((y - vy as f64) * 65535.0 / span_y) as i32).clamp(0, 65535),
     )
 }
 
@@ -949,5 +949,16 @@ mod tests {
         assert_eq!(require_click_count(1).unwrap(), 1);
         assert_eq!(require_click_count(3).unwrap(), 3);
         assert_eq!(send_input_error(2, 5, 87), "SendInput sent 2 of 5 events; GetLastError=87");
+    }
+
+    #[test]
+    fn virtual_abs_clamps_to_u16_bounds() {
+        // Normal bounds within single screen
+        assert_eq!(virtual_abs(0.0, 0.0, 0, 0, 1920, 1080), (0, 0));
+        assert_eq!(virtual_abs(1919.0, 1079.0, 0, 0, 1920, 1080), (65535, 65535));
+
+        // Out-of-bounds coordinates must be clamped to 0..=65535
+        assert_eq!(virtual_abs(-500.0, -200.0, 0, 0, 1920, 1080), (0, 0));
+        assert_eq!(virtual_abs(99999.0, 88888.0, 0, 0, 1920, 1080), (65535, 65535));
     }
 }
