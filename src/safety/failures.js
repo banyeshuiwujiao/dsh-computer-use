@@ -72,7 +72,7 @@ export const FAILURE_RULES = Object.freeze([
   {
     code: 'SCREEN_LOCKED',
     retry: RETRY.NEVER,
-    test: /\[SCREEN_LOCKED\]|desktop is locked|input desktop is |workstation is locked/i,
+    test: /\[SCREEN_LOCKED\]|desktop is locked|input desktop is |workstation is locked|OpenInputDesktop failed|secure desktop/i,
     hint: '当前不可交互（锁屏或安全桌面）。请先让用户解锁，再重试。',
   },
   {

@@ -90,6 +90,7 @@ fn name_is_lock_desktop(name: &str) -> bool {
         || lower.contains("disconnect")
         || lower == "lock"
         || lower.contains("lock screen")
+        || lower.contains("consent")
 }
 
 pub fn foreground_pid() -> u32 {
@@ -204,6 +205,8 @@ mod tests {
         assert!(name_is_lock_desktop("screensaver"));
         assert!(name_is_lock_desktop("Winlogon"));
         assert!(name_is_lock_desktop("winlogon"));
+        assert!(name_is_lock_desktop("Consent"));
+        assert!(name_is_lock_desktop("consent"));
         assert!(name_is_lock_desktop("Disconnect"));
         assert!(!name_is_lock_desktop("Default"));
         assert!(!name_is_lock_desktop("default"));

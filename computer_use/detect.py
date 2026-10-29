@@ -61,7 +61,7 @@ def lockapp_running() -> bool:
         # third-party tools legitimately create their own input desktops;
         # treating every non-Default name as "locked" refused all input there.
         lower = name.value.lower()
-        return lower in {"winlogon", "screensavers", "screen-saver", "screensaver", "disconnect", "lock"}
+        return lower in {"winlogon", "screensavers", "screen-saver", "screensaver", "disconnect", "lock", "consent"}
     except (OSError, AttributeError):
         return False
 

@@ -50,6 +50,20 @@ test('failures: the rules recognise the codes the gates raise', () => {
   }
 })
 
+test('failures: SCREEN_LOCKED recognises UAC consent desktop and OpenInputDesktop failure', () => {
+  const cases = [
+    'OpenInputDesktop failed',
+    'Windows desktop is locked (input desktop is Consent); unlock before using computer-use',
+    'active input desktop is an isolated secure desktop',
+    'desktop is locked (input desktop is SecureDesktop)',
+  ]
+  for (const msg of cases) {
+    const decorated = decorateFailure(new Error(msg))
+    assert.equal(decorated.code, 'SCREEN_LOCKED', `"${msg}" must map to SCREEN_LOCKED`)
+    assert.equal(decorated.retry, RETRY.NEVER, `"${msg}" must have retry: never`)
+  }
+})
+
 // ------------------------------------------------------------------- grant --
 
 test('grant: an explicit "off" beats the deployment default', () => {
