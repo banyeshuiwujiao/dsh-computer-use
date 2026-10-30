@@ -1115,6 +1115,30 @@ export function isWedged(state, app) {
   return Boolean(until && Date.now() < until)
 }
 
+/**
+ * Map low-level, actionable errors (window not found/closed, locked desktop, wedged
+ * UIA) to a message that tells the model exactly what to do next, clearing stale
+ * observation state. Returns null for anything it does not recognise. This is applied
+ * BOTH to errors returned as {ok:false,error} AND to exceptions thrown by `call`
+ * (the sidecar throws for an unknown/closed window before returning a result).
+ */
+export function friendlyActionError(state, input, rawMessage) {
+  const msg = String(rawMessage == null ? '' : rawMessage)
+  if (/window id \d+ was not found|was not found|IdGone|window .*?not found|window is gone|window was closed/i.test(msg)) {
+    state.lastElements = []
+    state.lastWindow = null
+    return new Error(`${msg} — the target window appears CLOSED or gone; call list_windows to re-locate it, then retry.`)
+  }
+  if (/desktop is locked|SecureDesktop/i.test(msg)) {
+    return new Error(`${msg} — the desktop is LOCKED; ask the user to unlock it, then retry.`)
+  }
+  if (/wedged|cooldown|no answer within|accessibility dump|UIA/i.test(msg)) {
+    noteWedge(state, input && input.window && input.window.app)
+    return new Error(`${msg} — NOTE: screenshots still work; retry without include_text and act by x/y coordinates.`)
+  }
+  return null
+}
+
 //: Tools whose coordinate form needs a cached capture session from the last
 //: observation; the first observation of a cold/just-restarted helper can leave
 //: that session empty. See {@link recoverCoordinateRefusal}.
@@ -1358,7 +1382,12 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       })()
       if (gate?.write) safety.beginWrite()
       try {
-        result = await ctx.dshComputerUse.call(spec.name, callInput, exec.signal, turnMeta)
+        try {
+          result = await ctx.dshComputerUse.call(spec.name, callInput, exec.signal, turnMeta)
+        } catch (thrown) {
+          const thrownMsg = thrown && thrown.message ? thrown.message : String(thrown)
+          throw friendlyActionError(state, input, thrownMsg) || thrown
+        }
         if (result && result.approvalRequest) {
           const refusal = normalizeApprovalRequest(result.approvalRequest)
           // Official helper_transport.js only treats the payload as an approval when
@@ -1378,19 +1407,7 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       if (gate?.write) safety.lease.note(gate.sessionId, spec.name)
       if (!result?.ok && result?.error) {
         const msg = String(result.error)
-        if (/window id \d+ was not found|was not found|IdGone|window .*?not found|window is gone|desktop is locked/i.test(msg)) {
-          state.lastElements = []
-          state.lastWindow = null
-          const hint = /locked|SecureDesktop/i.test(msg)
-            ? 'the desktop is LOCKED — ask the user to unlock it, then retry.'
-            : 'the target window appears CLOSED or gone; call list_windows to re-locate it, then retry.'
-          throw new Error(`${msg} — ${hint}`)
-        }
-        if (/wedged|cooldown|no answer within|UIA/i.test(msg)) {
-          noteWedge(state, input && input.window && input.window.app)
-          throw new Error(`${msg} — NOTE: screenshots still work; retry without include_text and act by x/y coordinates.`)
-        }
-        throw new Error(msg)
+        throw friendlyActionError(state, input, msg) || new Error(msg)
       }
       result = deriveAudioResult(result, spec.name)
       const value = result?.value ?? result
