@@ -5,7 +5,9 @@
  */
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
@@ -91,6 +93,13 @@ export const Config = Schema.object({
   // common round-trip sink (each field costs an observe→act→observe cycle), and
   // the guidance now names it as the preferred path for 2+ field forms.
   enabledTools: Schema.array(Schema.string()).default(['batch_actions', 'scroll_element', 'fill_form']),
+  /**
+   * When true (default), the FIRST time an app's UIA provider wedges, that app's
+   * accessibility text is served from the .NET ControlView fallback for the rest of
+   * the session (a latch), so a flaky helper can never keep charging the 15s dump
+   * timeout. Set false to keep the 60s-cooldown-then-retry behaviour.
+   */
+  fallbackLatchAfterWedge: Schema.boolean().default(true),
   // `preset` (V2 experience scope) was removed with the experience layer
   // (commits 0b11afb/bd2ef99); the option had no consumer left. Audit P2-10.
 })
@@ -249,13 +258,22 @@ async function registerDesktop(ctx, state, config) {
   }
   const enabled = new Set(config.enabledTools || [])
   const extras = harness.filter(spec => enabled.has(spec.name))
+  // "First wedge → permanently use fallback for this app this session" switch.
+  state.fallbackLatch = config.fallbackLatchAfterWedge !== false
   ctx.tools.register(healthTool(ctx, state, config))
-  // Standalone, helper-independent extension: a read-only CDP probe. It talks to the
-  // sidecar only through the same `call` bridge the window2 tools use, so it needs no
-  // helper surface entry (and cannot disturb the `WINDOW2_TOOLS` contract).
-  // NOTE: desktop `wait` is already a harness-provided tool; do NOT register one here
-  // (a duplicate name would abort the whole desktop tool registration).
+  // Standalone, helper-independent tools. They talk to the sidecar only through the
+  // same `call` bridge the window2 tools use, so they need no helper surface entry
+  // (and cannot disturb the `WINDOW2_TOOLS` contract).
+  // NOTE: there is NO harness-provided desktop `wait` — an earlier assumption of that
+  // was wrong; this plugin owns it. Register it once, here.
+  ctx.tools.register(waitTool(ctx, state))
+  // Read-only CDP probe (detect/enable CDP for Chromium/WebView2 hosts).
   ctx.tools.register(cdpProbeTool(ctx, state))
+  // Long-document + polling helpers (one-call scroll-to-end, wait-until, doc URLs).
+  ctx.tools.register(scrollToTool(ctx, state))
+  ctx.tools.register(reachLastPageTool(ctx, state))
+  ctx.tools.register(waitUntilTool(ctx, state))
+  ctx.tools.register(documentsTool(ctx, state))
   const exposed = desktops.concat(extras)
   for (const spec of exposed) {
     try {
@@ -265,7 +283,7 @@ async function registerDesktop(ctx, state, config) {
     }
   }
   state.exposedNames = exposed.map(spec => spec.name)
-    .concat(['computer_use_cdp_probe'])
+    .concat(['wait', 'computer_use_cdp_probe', 'scroll_to', 'reach_last_page', 'wait_until', 'computer_use_documents'])
     .filter((name, index, all) => all.indexOf(name) === index)
   publishToolNames(ctx, state)
 }
@@ -334,6 +352,10 @@ function healthTool(ctx, state, config, startError) {
         browserUnlocked: Boolean(state.browserUnlocked),
         browserSkill: BROWSER_SKILL,
         tools: { exposed: state.exposedNames, enabled: config.enabledTools },
+        fallback: {
+          latchAfterWedge: config.fallbackLatchAfterWedge !== false,
+          latchedApps: state.wedgeLatched instanceof Set ? [...state.wedgeLatched] : [],
+        },
         // The safety contract, seen from the calling session: may it drive the
         // desktop, does it hold the write lease, and are its tool schemas
         // currently hidden. This is the audit surface for "why was that
@@ -602,6 +624,229 @@ function cdpProbeTool() {
 }
 
 // ---------------------------------------------------------------------------
+// Long-document / polling helpers: scroll_to, reach_last_page, wait_until,
+// document-URL export, and region cropping.
+// ---------------------------------------------------------------------------
+
+// Author-facing value schema for a window handle. `required` is a per-property
+// annotation in the harness DSL; an object node must NOT carry a `required` array
+// (schema.ts assertAuthorKeys rejects it).
+const WIN_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    app: { type: 'string', required: true },
+    id: { type: 'integer', required: true },
+    title: { type: 'string' },
+  },
+}
+
+/** A `window` parameter (required) built from {@link WIN_SCHEMA}. */
+const WIN_PARAM = { ...WIN_SCHEMA, required: true }
+
+/** Write a base64 image to a temp file, crop it with System.Drawing, return base64 PNG. */
+const CROP_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'crop-image.ps1')
+
+export function normalizeRegion(region) {
+  if (!region || typeof region !== 'object') return null
+  const x = Math.max(0, Math.trunc(Number(region.x) || 0))
+  const y = Math.max(0, Math.trunc(Number(region.y) || 0))
+  const width = Math.trunc(Number(region.width) || 0)
+  const height = Math.trunc(Number(region.height) || 0)
+  if (width <= 0 || height <= 0) return null
+  return { x, y, width, height }
+}
+
+export function cropImageBase64(base64, mimeType, region) {
+  const rg = normalizeRegion(region)
+  if (!rg || !base64) return null
+  const inExt = /png/i.test(String(mimeType || '')) ? 'png' : 'jpg'
+  let dir = null
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-crop-'))
+    const inPath = path.join(dir, `in.${inExt}`)
+    const outPath = path.join(dir, 'out.png')
+    fs.writeFileSync(inPath, Buffer.from(base64, 'base64'))
+    execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', CROP_SCRIPT,
+      '-InPath', inPath, '-OutPath', outPath,
+      '-X', String(rg.x), '-Y', String(rg.y), '-W', String(rg.width), '-H', String(rg.height),
+    ], { timeout: 15_000, windowsHide: true })
+    return fs.readFileSync(outPath).toString('base64')
+  } catch {
+    return null
+  } finally {
+    try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+  }
+}
+
+/** Extract live document URLs from a .NET UIA node list (Document role). */
+export function collectDocumentUrls(nodes) {
+  const seen = new Set()
+  const out = []
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (!node) continue
+    const role = String(node.role || '').toLowerCase()
+    const value = String(node.value || '')
+    if ((role === 'document' || role === '文档') && /^https?:\/\//i.test(value) && !seen.has(value)) {
+      seen.add(value)
+      out.push({ url: value, title: String(node.name || '') })
+    }
+  }
+  return out
+}
+
+/** Shared sequential-scroll loop for scroll_to / reach_last_page. */
+export async function runScrollTo(ctx, state, args, exec, defaultSteps) {
+  const win = args && args.window
+  const percent = args && args.percent !== undefined ? Math.min(Math.max(Number(args.percent) || 0, 0), 100) : null
+  const to = percent !== null ? (percent >= 50 ? 'bottom' : 'top') : (args.to === 'top' ? 'top' : 'bottom')
+  const steps = Math.min(Math.max(Math.trunc(args.steps ?? defaultSteps), 1), 80)
+  const perStep = Math.min(Math.max(Math.trunc(args.delta ?? 12000), 200), 60000) * (to === 'top' ? -1 : 1)
+  const meta = state && state.lastShotMeta
+  const x = Number.isFinite(args.x) ? args.x : Math.round(((meta && meta.width) || 800) / 2)
+  const y = Number.isFinite(args.y) ? args.y : Math.round(((meta && meta.height) || 600) / 2)
+  const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
+  let done = 0
+  for (let i = 0; i < steps; i += 1) {
+    const r = await ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
+    if (!r || r.ok === false) break
+    done += 1
+  }
+  return { tool: 'scroll_to', to, percent, stepsDone: done, perStep, at: { x, y } }
+}
+
+export function scrollToTool(ctx, state) {
+  return defineTool({
+    name: 'scroll_to',
+    description:
+      'Scroll a window to the bottom (default) or top, or toward an approximate percent, in ONE call by issuing '
+      + 'several SEQUENTIAL wheel scrolls. This replaces the "one scroll per round-trip" dance and avoids the batch '
+      + 'coalescing that makes many parallel scrolls a no-op. Pass x/y inside the scrollable pane.',
+    parameters: {
+      window: WIN_PARAM,
+      to: { type: 'string', enum: ['bottom', 'top'], description: 'Direction (default bottom).' },
+      percent: { type: 'integer', description: 'Approximate target percent 0-100; >=50 scrolls down, <50 up.' },
+      steps: { type: 'integer', description: 'Max scroll pulses (default 12, clamp 1..80).' },
+      delta: { type: 'integer', description: 'Pixels per pulse (default 12000, clamp 200..60000).' },
+      x: { type: 'number', description: 'X inside the scroll pane (default window centre).' },
+      y: { type: 'number', description: 'Y inside the scroll pane (default window centre).' },
+    },
+    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
+    async execute(args, exec) {
+      return { value: await runScrollTo(ctx, state, args && typeof args === 'object' ? args : {}, exec, 12) }
+    },
+    isConcurrencySafe() { return false },
+    presentCall(a) { return { card: 'generic', title: 'scroll_to', rawInput: a && typeof a === 'object' ? a : {} } },
+  })
+}
+
+export function reachLastPageTool(ctx, state) {
+  return defineTool({
+    name: 'reach_last_page',
+    description:
+      'Scroll a long document to its LAST page in one call (a scroll_to(bottom) with a bigger default pulse budget). '
+      + 'For readers/viewers that only count completion when the last page is reached.',
+    parameters: {
+      window: WIN_PARAM,
+      steps: { type: 'integer', description: 'Max scroll pulses (default 40, clamp 1..80).' },
+      delta: { type: 'integer', description: 'Pixels per pulse (default 40000).' },
+      x: { type: 'number', description: 'X inside the scroll pane (default window centre).' },
+      y: { type: 'number', description: 'Y inside the scroll pane (default window centre).' },
+    },
+    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
+    async execute(args, exec) {
+      const a = args && typeof args === 'object' ? { ...args, to: 'bottom' } : { to: 'bottom' }
+      if (a.delta === undefined) a.delta = 40000
+      return { value: await runScrollTo(ctx, state, a, exec, 40) }
+    },
+    isConcurrencySafe() { return false },
+    presentCall(a) { return { card: 'generic', title: 'reach_last_page', rawInput: a && typeof a === 'object' ? a : {} } },
+  })
+}
+
+export function waitUntilTool(ctx, state) {
+  return defineTool({
+    name: 'wait_until',
+    description:
+      'Poll a window until a condition is met instead of a blind fixed sleep: waits until `text` appears in the '
+      + 'accessibility tree, or until the screenshot `change`s from the first frame. Returns {satisfied, reason, waitedMs, polls}.',
+    parameters: {
+      window: WIN_PARAM,
+      text: { type: 'string', description: 'Wait until this text appears in the accessibility tree / UIA fallback.' },
+      change: { type: 'boolean', description: 'Wait until the screenshot differs from the first captured frame.' },
+      timeoutMs: { type: 'integer', description: 'Max wait (default 15000, clamp 0..120000).' },
+      intervalMs: { type: 'integer', description: 'Poll interval (default 700, clamp 100..5000).' },
+    },
+    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
+    async execute(args, exec) {
+      const win = args && args.window
+      const wantText = typeof args?.text === 'string' && args.text.length > 0
+      const wantChange = Boolean(args?.change)
+      if (!wantText && !wantChange) return { value: { satisfied: false, reason: 'no-condition', waitedMs: 0, polls: 0 } }
+      const timeout = Math.min(Math.max(Math.trunc(args.timeoutMs ?? 15_000), 0), 120_000)
+      const interval = Math.min(Math.max(Math.trunc(args.intervalMs ?? 700), 100), 5_000)
+      const chromium = looksLikeChromiumHost(win)
+      const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
+      const start = Date.now()
+      let polls = 0
+      let baseHash = null
+      while (true) {
+        polls += 1
+        // Screenshot only when we need a change hash; text comes from the fallback for
+        // Chromium hosts (fast, avoids the helper's 15s a11y dump).
+        const res = await ctx.dshComputerUse.call(
+          'get_window_state',
+          { window: win, include_screenshot: Boolean(wantChange), include_text: wantText && !chromium },
+          exec.signal, turnMeta,
+        )
+        const val = res && res.value !== undefined ? res.value : res
+        if (wantChange) {
+          const img = (res && Array.isArray(res.images) ? res.images : [])[0]
+          if (img && img.data) {
+            const h = crypto.createHash('sha1').update(String(img.data)).digest('hex')
+            if (baseHash === null) baseHash = h
+            else if (h !== baseHash) return { value: { satisfied: true, reason: 'screen-changed', waitedMs: Date.now() - start, polls } }
+          }
+        }
+        if (wantText) {
+          let tree = val && val.accessibility && typeof val.accessibility.tree === 'string' ? val.accessibility.tree : ''
+          if (!tree && chromium) {
+            const fb = uiaTreeFallback(Number(win && win.id))
+            if (Array.isArray(fb) && fb.length) tree = formatUiaFallback(fb)
+          }
+          if (tree.includes(args.text)) return { value: { satisfied: true, reason: 'text-appeared', waitedMs: Date.now() - start, polls } }
+        }
+        if (Date.now() - start >= timeout) return { value: { satisfied: false, reason: 'timeout', waitedMs: Date.now() - start, polls } }
+        await sleepRespectingSignal(interval, exec.signal)
+      }
+    },
+    isConcurrencySafe() { return false },
+    presentCall(a) { return { card: 'generic', title: 'wait_until', rawInput: a && typeof a === 'object' ? a : {} } },
+  })
+}
+
+export function documentsTool() {
+  return defineTool({
+    name: 'computer_use_documents',
+    description:
+      'List live document URLs exposed by a window via UIA (Document role ValuePattern). For PDF/viewer courseware this '
+      + 'returns the resource URL so the content can be fetched/read directly instead of scrolling page by page. Read-only.',
+    parameters: {
+      window: WIN_PARAM,
+    },
+    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
+    async execute(args) {
+      const win = args && args.window
+      const nodes = uiaTreeFallback(Number(win && win.id)) || []
+      return { value: { documentUrls: collectDocumentUrls(nodes), nodes: Array.isArray(nodes) ? nodes.length : 0 } }
+    },
+    isConcurrencySafe() { return true },
+    presentCall() { return { card: 'generic', title: 'computer_use_documents' } },
+  })
+}
+
+// ---------------------------------------------------------------------------
 // UIA tree semantic compression + dead-tree detection.
 //
 // A Chromium/WebView2/mini-program (WMPF) window publishes only a chain of
@@ -653,8 +898,14 @@ function nodeIsMeaningful(node) {
 }
 
 /** Does this node carry actual *content* (a live value/description, not just a label)? */
+// Window-chrome roles carry labels but never page content; their `Value:` (e.g. the
+// title bar's window title) must NOT be mistaken for content, otherwise it masks a
+// genuinely useless/anonymous content tree and blocks the .NET fallback.
+const CHROME_ROLES = new Set(['titlebar', '标题栏', 'menubar', '菜单栏', 'statusbar', '状态栏'])
+
 function nodeHasContent(node) {
   if (!node) return false
+  if (CHROME_ROLES.has(node.role)) return false
   if (node.rest.includes('Value: ') || node.rest.includes('Description: ')) return true
   // A text/document role that carries a readable name is content too.
   return (node.role === 'text' || node.role === '文本' || node.role === '文档') && nodeIsMeaningful(node)
@@ -801,6 +1052,69 @@ export function uiaTreeFallback(hwnd, maxNodes = 800) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Observation/upgrade helpers: screenshot-id externalisation + wedge memory.
+// ---------------------------------------------------------------------------
+
+/**
+ * Hand out monotonically increasing external screenshot ids so a reused helper id
+ * (e.g. "screenshot-0" after the helper's capture session resets) can never be
+ * mistaken for "not the latest observation". The mapping external→helper is kept
+ * so an input action's screenshotId can be translated back before it reaches the
+ * helper (which only knows its own ids).
+ */
+export function externalizeScreenshotIds(state, value) {
+  if (!value || !Array.isArray(value.screenshots)) return
+  state.shotSeq = Number.isInteger(state.shotSeq) ? state.shotSeq : 0
+  state.shotMap = state.shotMap instanceof Map ? state.shotMap : new Map()
+  for (const shot of value.screenshots) {
+    if (!shot || typeof shot.id !== 'string') continue
+    const helperId = shot.id
+    state.shotSeq += 1
+    const ext = `shot-${state.shotSeq}`
+    state.shotMap.set(ext, helperId)
+    shot.id = ext
+    shot.helperId = helperId
+    // Remember the window's pixel size so scroll_to can default to its centre.
+    if (!state.lastShotMeta && shot.width && shot.height) {
+      state.lastShotMeta = { width: shot.width, height: shot.height }
+    }
+  }
+}
+
+/** Translate an external screenshotId back to the helper's id, in place. */
+export function translateScreenshotId(state, input) {
+  if (!input || typeof input.screenshotId !== 'string') return
+  const map = state.shotMap
+  if (map instanceof Map && map.has(input.screenshotId)) input.screenshotId = map.get(input.screenshotId)
+}
+
+/**
+ * Remember that this app's UIA provider is wedged.
+ *
+ * The 60s cooldown is always recorded. When `state.fallbackLatch` is on (the
+ * `fallbackLatchAfterWedge` config, default true), the FIRST wedge also latches
+ * this app to the .NET fallback for the rest of the session, so a flaky helper can
+ * never keep charging the 15s dump timeout again.
+ */
+export function noteWedge(state, app) {
+  if (!app) return
+  state.wedged = state.wedged instanceof Map ? state.wedged : new Map()
+  state.wedged.set(app, Date.now() + 60_000)
+  if (state.fallbackLatch) {
+    state.wedgeLatched = state.wedgeLatched instanceof Set ? state.wedgeLatched : new Set()
+    state.wedgeLatched.add(app)
+  }
+}
+
+export function isWedged(state, app) {
+  if (!app) return false
+  if (state.wedgeLatched instanceof Set && state.wedgeLatched.has(app)) return true
+  if (!(state.wedged instanceof Map)) return false
+  const until = state.wedged.get(app)
+  return Boolean(until && Date.now() < until)
+}
+
 //: Tools whose coordinate form needs a cached capture session from the last
 //: observation; the first observation of a cold/just-restarted helper can leave
 //: that session empty. See {@link recoverCoordinateRefusal}.
@@ -813,13 +1127,15 @@ const COORDINATE_TOOLS = new Set(['click', 'scroll', 'drag'])
  * is safe and turns a two-round-trip model dance into zero. Anything else is left
  * untouched for the caller to see.
  */
-async function recoverCoordinateRefusal(ctx, state, spec, exec, input, result, turnMeta) {
+export async function recoverCoordinateRefusal(ctx, state, spec, exec, input, result, turnMeta) {
   if (!result || result.ok || !result.error) return result
   if (!COORDINATE_TOOLS.has(spec.name)) return result
   const message = String(result.error)
   const recoverable = /none is cached/i.test(message)
     || /not the latest observation/i.test(message)
     || /unknown screenshotId/i.test(message)
+    || /bounds changed before coordinate input/i.test(message)
+    || /window bounds changed/i.test(message)
   if (!recoverable) return result
   if (!input || typeof input.window !== 'object' || input.window === null) return result
   try {
@@ -895,6 +1211,20 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       parameters.properties.text = {
         description: 'Optional element text or name to target (automatically matches element_index from latest get_window_state accessibility tree).',
         type: 'string',
+      }
+    }
+  } else if (spec.name === 'get_window_state') {
+    // DSH extension: capture only a window-relative rectangle, cropped locally.
+    if (parameters.properties && !parameters.properties.region) {
+      parameters.properties.region = {
+        type: 'object',
+        description: 'Capture only this window-relative rectangle {x,y,width,height} instead of the whole window (saves tokens for long documents).',
+        properties: {
+          x: { type: 'number', description: 'Left offset (window-relative).' },
+          y: { type: 'number', description: 'Top offset (window-relative).' },
+          width: { type: 'number', description: 'Crop width.' },
+          height: { type: 'number', description: 'Crop height.' },
+        },
       }
     }
   }
@@ -1011,9 +1341,24 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       // in the middle of this one. The idle clock restarts when the write
       // *finishes*, not when it was accepted.
       let result
+      translateScreenshotId(state, input)
+      // Serve accessibility text from the .NET ControlView fallback (richer, fast, no
+      // 15s helper dump) when the window is a Chromium/WebView2 host OR when this app
+      // is already wedged/latched to the fallback. That includes the "first wedge →
+      // permanently fall back this session" latch (config fallbackLatchAfterWedge).
+      const textViaFallback = spec.name === 'get_window_state'
+        && Boolean(input && input.include_text)
+        && (looksLikeChromiumHost(input && input.window)
+          || isWedged(state, input && input.window && input.window.app))
+      const region = spec.name === 'get_window_state' ? normalizeRegion(input && input.region) : null
+      const callInput = (() => {
+        const c = textViaFallback ? { ...input, include_text: false } : { ...input }
+        if (spec.name === 'get_window_state') delete c.region
+        return c
+      })()
       if (gate?.write) safety.beginWrite()
       try {
-        result = await ctx.dshComputerUse.call(spec.name, input, exec.signal, turnMeta)
+        result = await ctx.dshComputerUse.call(spec.name, callInput, exec.signal, turnMeta)
         if (result && result.approvalRequest) {
           const refusal = normalizeApprovalRequest(result.approvalRequest)
           // Official helper_transport.js only treats the payload as an approval when
@@ -1023,75 +1368,109 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         }
         // First-observation usability: a coordinate click/scroll/drag can be refused
         // because the previous get_window_state cached no capture session (a cold or
-        // just-restarted helper), or because the caller passed a screenshotId that a
-        // newer observation superseded. Both are recoverable without the model
-        // re-deriving the plan: re-observe once, drop the stale screenshotId, retry.
+        // just-restarted helper), or because the caller passed a stale screenshotId, or
+        // because the window bounds changed (RDP resize). All are recoverable without
+        // the model re-deriving the plan: re-observe once, drop the stale id, retry.
         result = await recoverCoordinateRefusal(ctx, state, spec, exec, input, result, turnMeta)
       } finally {
         if (gate?.write) safety.finishWrite()
       }
       if (gate?.write) safety.lease.note(gate.sessionId, spec.name)
-      if (!result?.ok && result?.error) throw new Error(String(result.error))
+      if (!result?.ok && result?.error) {
+        const msg = String(result.error)
+        if (/window id \d+ was not found|was not found|IdGone|window .*?not found|window is gone|desktop is locked/i.test(msg)) {
+          state.lastElements = []
+          state.lastWindow = null
+          const hint = /locked|SecureDesktop/i.test(msg)
+            ? 'the desktop is LOCKED — ask the user to unlock it, then retry.'
+            : 'the target window appears CLOSED or gone; call list_windows to re-locate it, then retry.'
+          throw new Error(`${msg} — ${hint}`)
+        }
+        if (/wedged|cooldown|no answer within|UIA/i.test(msg)) {
+          noteWedge(state, input && input.window && input.window.app)
+          throw new Error(`${msg} — NOTE: screenshots still work; retry without include_text and act by x/y coordinates.`)
+        }
+        throw new Error(msg)
+      }
       result = deriveAudioResult(result, spec.name)
       const value = result?.value ?? result
-      if (spec.name === 'get_window_state' && value?.accessibility?.tree) {
-        const classification = classifyAccessibilityTree(value.accessibility.tree, input && input.window)
-        if (classification.dead) {
-          // The helper's tree has no content for this window. Before declaring the
-          // path dead, try the .NET UIAutomation ControlView fallback: for Chromium/
-          // WebView2/mini-program windows the helper under-reports, but a ControlView
-          // walk DOES reach Document/Text/ListItem (and the Document value is the URL).
-          const hwnd = Number(input?.window?.id)
-          const fallback = uiaTreeFallback(hwnd)
-          if (Array.isArray(fallback) && fallback.length >= 3) {
-            value.accessibility.tree = formatUiaFallback(fallback)
-            value.accessibility.semantic = {
-              dead: false,
-              source: 'uia-dotnet-fallback',
-              nodes: fallback.length,
-              helperNodes: classification.total,
-            }
-            // No helper element_index here: leave lastElements empty so a stray
-            // element_index cannot resolve against a fallback line. Act by x/y.
+      if (spec.name === 'get_window_state' && value && typeof value === 'object') {
+        // Monotonic external screenshot ids (see externalizeScreenshotIds).
+        externalizeScreenshotIds(state, value)
+        const win = input && typeof input.window === 'object' ? input.window : null
+        const app = win ? String(win.app || '') : ''
+        const wantText = Boolean(input && input.include_text)
+        const ax = value.accessibility && typeof value.accessibility === 'object' ? value.accessibility : null
+        const axError = ax && typeof ax.error === 'string' ? ax.error : ''
+        if (axError && /wedged|cooldown|no answer within|timeout/i.test(axError)) noteWedge(state, app)
+        let tree = ax && typeof ax.tree === 'string' ? ax.tree : ''
+        let source = tree ? 'helper' : ''
+        // Chromium/WebView2 hosts: serve text from the .NET ControlView fallback —
+        // faster than the helper and it reaches content the helper under-reports.
+        if (wantText && (looksLikeChromiumHost(win) || isWedged(state, app))) {
+          const fb = uiaTreeFallback(Number(win && win.id))
+          if (Array.isArray(fb) && fb.length >= 3) {
+            tree = formatUiaFallback(fb)
+            source = 'uia-dotnet-fallback'
+            if (!value.accessibility || typeof value.accessibility !== 'object') value.accessibility = {}
+            value.accessibility.tree = tree
+            value.accessibility.semantic = { dead: false, source, nodes: fb.length }
+            const docUrls = collectDocumentUrls(fb)
+            if (docUrls.length) value.accessibility.documentUrls = docUrls
             state.lastElements = []
-            state.lastWindow = input && typeof input.window === 'object'
-              ? { app: input.window.app, id: input.window.id, title: input.window.title }
-              : null
-          } else {
-            // Both the helper tree AND the .NET fallback are empty/blocked: emit the
-            // explicit "this path is dead" verdict (with a cached CDP probe) so the
-            // model stops wasting tokens and switches to vision + pixel input.
-            const cdp = await cachedCdpProbe(state, input && input.window)
-            value.accessibility.tree = deadTreeSignal(classification, cdp)
-            value.accessibility.semantic = {
-              dead: true,
-              totalNodes: classification.total,
-              meaningfulNodes: classification.meaningful,
-              fallbackTried: true,
-              cdpAttachable: Boolean(cdp && cdp.canAttach),
-            }
-            state.lastElements = []
-            state.lastWindow = input && typeof input.window === 'object'
-              ? { app: input.window.app, id: input.window.id, title: input.window.title }
-              : null
+            state.lastWindow = win ? { app: win.app, id: win.id, title: win.title } : null
           }
-        } else {
-          // Semantic compression: drop decorative anonymous leaves, keep the
-          // structure that leads to real content (indices unchanged).
-          const compressed = compressAccessibilityTree(value.accessibility.tree)
-          value.accessibility.tree = compressed
-          value.accessibility.semantic = {
-            dead: false,
-            totalNodes: classification.total,
-            meaningfulNodes: classification.meaningful,
-          }
-          state.lastElements = extractInteractiveElements(compressed)
-          // Remember which window those indices describe (audit P1-4): text
-          // selection must never resolve against another window's observation.
-          state.lastWindow = input && typeof input.window === 'object'
-            ? { app: input.window.app, id: input.window.id, title: input.window.title }
-            : null
         }
+        if (tree) {
+          if (!(value.accessibility && value.accessibility.semantic)) {
+            if (!value.accessibility || typeof value.accessibility !== 'object') value.accessibility = {}
+            const classification = classifyAccessibilityTree(tree, win)
+            if (classification.dead) {
+              const fb2 = uiaTreeFallback(Number(win && win.id))
+              if (Array.isArray(fb2) && fb2.length >= 3) {
+                value.accessibility.tree = formatUiaFallback(fb2)
+                value.accessibility.semantic = { dead: false, source: 'uia-dotnet-fallback', nodes: fb2.length, helperNodes: classification.total }
+                state.lastElements = []
+                state.lastWindow = win ? { app: win.app, id: win.id, title: win.title } : null
+              } else {
+                const cdp = await cachedCdpProbe(state, win)
+                value.accessibility.tree = deadTreeSignal(classification, cdp)
+                value.accessibility.semantic = { dead: true, totalNodes: classification.total, meaningfulNodes: classification.meaningful, fallbackTried: true, cdpAttachable: Boolean(cdp && cdp.canAttach) }
+                state.lastElements = []
+                state.lastWindow = win ? { app: win.app, id: win.id, title: win.title } : null
+              }
+            } else {
+              const compressed = compressAccessibilityTree(tree)
+              value.accessibility.tree = compressed
+              value.accessibility.semantic = { dead: false, totalNodes: classification.total, meaningfulNodes: classification.meaningful, source }
+              state.lastElements = extractInteractiveElements(compressed)
+              state.lastWindow = win ? { app: win.app, id: win.id, title: win.title } : null
+            }
+          }
+        } else if (wantText && (axError || isWedged(state, app))) {
+          if (!value.accessibility || typeof value.accessibility !== 'object') value.accessibility = {}
+          value.accessibility.guidance = 'UIA provider is wedged/unavailable for this window. The SCREENSHOT IS STILL VALID — act by x/y coordinates; accessibility text is unavailable right now.'
+          value.accessibility.semantic = { dead: false, source: 'none-wedged' }
+        }
+      }
+      // Region crop (token saving): crop each captured frame to the requested rectangle.
+      if (spec.name === 'get_window_state' && region && Array.isArray(result?.images)) {
+        const cropped = []
+        for (const im of result.images) {
+          if (!im || !im.data) { cropped.push(im); continue }
+          const out = cropImageBase64(im.data, im.mimeType, region)
+          cropped.push(out ? { ...im, data: out, mimeType: 'image/png' } : im)
+        }
+        result.images = cropped
+        if (Array.isArray(value?.screenshots)) {
+          for (const s of value.screenshots) {
+            s.width = Math.min(s.width || region.width, region.width)
+            s.height = Math.min(s.height || region.height, region.height)
+            s.originX = (s.originX || 0) + region.x
+            s.originY = (s.originY || 0) + region.y
+          }
+        }
+        if (value && typeof value === 'object') value.region = region
       }
       const refs = await admitImages(ctx, result?.images || [])
       return { value, images: refs }
