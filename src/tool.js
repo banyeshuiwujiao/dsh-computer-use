@@ -5,6 +5,9 @@
  */
 
 import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { computerUsePrompt, documentationSummary, promptAssetStatus, BROWSER_REQUIRED_FOR } from './prompt.js'
@@ -93,12 +96,12 @@ export const Config = Schema.object({
 })
 
 const OUTPUT_SCHEMA = {
+  // `value` carries arbitrary tool output (object, array, string, number...), so the
+  // schema is intentionally open. The host validator rejects an untyped `properties.value`
+  // (both `{}` and `{type:'json'}` fail), so we declare no properties at all and accept
+  // any object shape via additionalProperties.
   type: 'object',
   additionalProperties: true,
-  properties: {
-    value: {},
-    images: { type: 'array' },
-  },
 }
 
 const BROWSER_SKILL = 'computer-use-browser'
@@ -247,6 +250,12 @@ async function registerDesktop(ctx, state, config) {
   const enabled = new Set(config.enabledTools || [])
   const extras = harness.filter(spec => enabled.has(spec.name))
   ctx.tools.register(healthTool(ctx, state, config))
+  // Standalone, helper-independent extension: a read-only CDP probe. It talks to the
+  // sidecar only through the same `call` bridge the window2 tools use, so it needs no
+  // helper surface entry (and cannot disturb the `WINDOW2_TOOLS` contract).
+  // NOTE: desktop `wait` is already a harness-provided tool; do NOT register one here
+  // (a duplicate name would abort the whole desktop tool registration).
+  ctx.tools.register(cdpProbeTool(ctx, state))
   const exposed = desktops.concat(extras)
   for (const spec of exposed) {
     try {
@@ -256,6 +265,8 @@ async function registerDesktop(ctx, state, config) {
     }
   }
   state.exposedNames = exposed.map(spec => spec.name)
+    .concat(['computer_use_cdp_probe'])
+    .filter((name, index, all) => all.indexOf(name) === index)
   publishToolNames(ctx, state)
 }
 
@@ -373,6 +384,466 @@ function healthTool(ctx, state, config, startError) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Standalone, helper-independent tools: `wait` and `computer_use_cdp_probe`.
+// ---------------------------------------------------------------------------
+
+const WAIT_MAX_MS = 60_000
+
+/** Sleeping that honours the tool-call abort signal. */
+function sleepRespectingSignal(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error('wait aborted')); return }
+    const timer = setTimeout(() => { cleanup(); resolve() }, ms)
+    const onAbort = () => { cleanup(); reject(new Error('wait aborted')) }
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener?.('abort', onAbort) }
+    signal?.addEventListener?.('abort', onAbort)
+  })
+}
+
+/**
+ * Desktop `wait`: the missing counterpart of the browser's `tab_pw_wait_for_timeout`.
+ * Auto-playing media, animations, debounced search boxes and polling loops all need
+ * a pause; without this the model either wastes a helper round-trip or fakes it with
+ * a shell sleep. `observe:true` folds a fresh get_window_state into the same call so
+ * the very next action is grounded in current state.
+ */
+function waitTool(ctx, state) {
+  return defineTool({
+    name: 'wait',
+    description:
+      'Wait a fixed duration without a helper round-trip. Use it for auto-playing media, animations, debounced UI, '
+      + 'or between polls. Set observe:true with a window to also take a fresh get_window_state (screenshot, and '
+      + 'optionally the accessibility tree) after the wait so the next action is grounded in current state. '
+      + 'Desktop counterpart of the browser tab wait.',
+    parameters: {
+      ms: { type: 'integer', description: 'Milliseconds to wait (default 1000, clamped to 0..60000).' },
+      window: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Optional target window to observe after the wait (required when observe:true).',
+        properties: {
+          app: { type: 'string', required: true },
+          id: { type: 'integer', required: true },
+          title: { type: 'string' },
+        },
+      },
+      observe: { type: 'boolean', description: 'When true and a window is given, take a fresh get_window_state after waiting (default false).' },
+      include_text: { type: 'boolean', description: 'With observe:true, also return the indexed accessibility tree (default false).' },
+    },
+    output: { schema: OUTPUT_SCHEMA, render(_args, value) { return renderValue(value) } },
+    async execute(args, exec) {
+      const raw = Number(args?.ms ?? 1000)
+      const ms = Number.isFinite(raw) ? Math.min(Math.max(Math.trunc(raw), 0), WAIT_MAX_MS) : 1000
+      await sleepRespectingSignal(ms, exec?.signal)
+      const out = { waitedMs: ms }
+      if (args?.observe && args?.window) {
+        const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
+        const res = await ctx.dshComputerUse.call(
+          'get_window_state',
+          { window: args.window, include_screenshot: true, include_text: Boolean(args.include_text) },
+          exec.signal,
+          turnMeta,
+        )
+        if (res && res.ok === false && res.error) throw new Error(String(res.error))
+        const value = res && res.value !== undefined ? res.value : res
+        if (value?.accessibility?.tree) {
+          state.lastElements = extractInteractiveElements(value.accessibility.tree)
+          state.lastWindow = { app: args.window.app, id: args.window.id, title: args.window.title }
+        }
+        const refs = await admitImages(ctx, res?.images || [])
+        return { value: { ...out, observation: value }, images: refs }
+      }
+      return { value: out, images: [] }
+    },
+    isConcurrencySafe() { return true },
+    presentCall(args) { return { card: 'generic', title: 'wait', rawInput: args && typeof args === 'object' ? args : {} } },
+  })
+}
+
+/** Win32 process rows for a name/path, via a single read-only CIM query. */
+function listProcessRows(filter) {
+  const script = `$ErrorActionPreference='SilentlyContinue'; Get-CimInstance Win32_Process${filter} | Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress`
+  try {
+    const raw = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024,
+    }).trim()
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : [parsed]
+  } catch {
+    return []
+  }
+}
+
+/** Read a Chromium `DevToolsActivePort` file: line 1 is the port, line 2 the path. */
+function readDevToolsActivePort(file) {
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/)
+    const port = Number(String(lines[0] || '').trim())
+    if (Number.isInteger(port) && port > 0 && port < 65536) {
+      return { port, wsPath: String(lines[1] || '').trim() }
+    }
+  } catch { /* not present */ }
+  return null
+}
+
+async function fetchCdpVersion(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(900) })
+    if (!res.ok) return null
+    const data = await res.json()
+    return { port, browser: data?.Browser ?? null, webSocketDebuggerUrl: data?.webSocketDebuggerUrl ?? null }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Is this window's process a Chromium/WebView2 host whose CDP endpoint is reachable?
+ * WeChat's mini-program runtime (WeChatAppEx / RadiumWMPF) is Chromium-derived but does
+ * NOT honour --remote-debugging-port and exposes no DevToolsActivePort, so it can only
+ * ever be pixel-driven — this probe says so explicitly instead of letting the model
+ * keep hunting for a DOM route that cannot exist.
+ */
+async function probeCdp(args) {
+  let exe = ''
+  if (typeof args.process === 'string' && args.process.trim()) exe = args.process.trim()
+  else if (args.window && typeof args.window.app === 'string') {
+    const m = /^process:(.+)$/i.exec(args.window.app)
+    exe = m ? m[1] : args.window.app
+  }
+  let rows = []
+  if (Number.isInteger(args.pid) && args.pid > 0) {
+    rows = listProcessRows(` -Filter "ProcessId=${args.pid}"`)
+  } else if (exe) {
+    const base = path.basename(exe).replace(/'/g, "''")
+    rows = listProcessRows(` -Filter "Name='${base}'"`)
+    const wantPath = exe.toLowerCase()
+    if (rows.some(r => r.ExecutablePath)) {
+      const matched = rows.filter(r => String(r.ExecutablePath || '').toLowerCase() === wantPath)
+      if (matched.length) rows = matched
+    }
+  }
+  const ports = new Set()
+  const pipePids = []
+  const devToolsActivePorts = []
+  for (const row of rows) {
+    const cmd = String(row.CommandLine || '')
+    const portMatch = /--remote-debugging-port=(\d+)/i.exec(cmd)
+    if (portMatch) ports.add(Number(portMatch[1]))
+    if (/--remote-debugging-pipe/i.test(cmd)) pipePids.push(Number(row.ProcessId))
+    const ud = /--user-data-dir="?([^"\s]+)"?/i.exec(cmd) || /--webview-user-data-folder="?([^"\s]+)"?/i.exec(cmd)
+    if (ud) {
+      const found = readDevToolsActivePort(path.join(ud[1], 'DevToolsActivePort'))
+      if (found) { devToolsActivePorts.push({ file: path.join(ud[1], 'DevToolsActivePort'), ...found }); ports.add(found.port) }
+    }
+  }
+  const endpoints = []
+  for (const port of ports) {
+    const version = await fetchCdpVersion(port)
+    if (version) endpoints.push(version)
+  }
+  const blob = rows.map(r => `${r.Name || ''} ${r.ExecutablePath || ''} ${r.CommandLine || ''}`).join(' ')
+  const chromiumLike = /chrome|chromium|msedge|electron|webview2|WeChatAppEx|RadiumWMPF|wmpf/i.test(blob)
+  const canAttach = endpoints.length > 0
+  let guidance
+  if (canAttach) {
+    const port = endpoints[0].port
+    guidance = `CDP is reachable on 127.0.0.1:${port}. Attach chrome-devtools MCP with --browserUrl http://127.0.0.1:${port} and drive the DOM instead of pixels.`
+  } else if (chromiumLike) {
+    guidance = exe && /WeChatAppEx|RadiumWMPF|wmpf/i.test(`${exe} ${blob}`)
+      ? 'Chromium-derived host (WeChat WMPF/Radium) with NO CDP endpoint. It ignores --remote-debugging-port and writes no DevToolsActivePort, so DOM automation is not available — drive this window by screenshot + coordinates.'
+      : 'Chromium/WebView2 host but no CDP endpoint is exposed right now. To enable it, relaunch that app with --remote-debugging-port=<free> (or, for a WebView2 host, set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<free> before launch), then probe again.'
+  } else {
+    guidance = 'The target process does not look like a Chromium/WebView2 host; CDP does not apply. Use the window2 pixel/UIA path.'
+  }
+  return {
+    probed: { exe: exe || null, pids: rows.map(r => Number(r.ProcessId)), matchedProcesses: rows.length },
+    chromiumLike,
+    remoteDebuggingPorts: [...ports],
+    remoteDebuggingPipePids: pipePids,
+    devToolsActivePorts,
+    endpoints,
+    canAttach,
+    guidance,
+  }
+}
+
+function cdpProbeTool() {
+  return defineTool({
+    name: 'computer_use_cdp_probe',
+    description:
+      'Detect whether a window belongs to a Chromium/WebView2 host and whether its CDP endpoint is reachable, '
+      + 'so DOM-level automation can replace pixel clicks when possible. Reports the debugging port/ws endpoint, '
+      + 'DevToolsActivePort files, or the exact enablement step. WeChat WMPF/Radium renderers expose no CDP and stay '
+      + 'pixel-driven. Read-only.',
+    parameters: {
+      window: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Window to probe (its app identifier names the process).',
+        properties: {
+          app: { type: 'string', required: true },
+          id: { type: 'integer', required: true },
+          title: { type: 'string' },
+        },
+      },
+      process: { type: 'string', description: 'Process name or full exe path to probe instead of a window.' },
+      pid: { type: 'integer', description: 'Explicit process id to probe.' },
+    },
+    output: { schema: OUTPUT_SCHEMA, render(_args, value) { return renderValue(value) } },
+    async execute(args) {
+      return { value: await probeCdp(args && typeof args === 'object' ? args : {}) }
+    },
+    isConcurrencySafe() { return true },
+    presentCall() { return { card: 'generic', title: 'computer_use_cdp_probe' } },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// UIA tree semantic compression + dead-tree detection.
+//
+// A Chromium/WebView2/mini-program (WMPF) window publishes only a chain of
+// anonymous containers over UIA: no names, no roles, no values. Printing that
+// tree costs thousands of tokens and tells the model nothing. Two levers:
+//   1. compress: drop decorative leaves and keep only meaningful nodes plus the
+//      ancestors that hold them (indices are preserved, so element_index stays valid).
+//   2. detect dead: if the tree is (almost) all anonymous containers, stop
+//      pretending it is usable and emit one explicit "this path is dead" verdict.
+// ---------------------------------------------------------------------------
+
+// Roles that carry no information on their own (their *name* would have to).
+const GENERIC_CONTAINER_ROLES = new Set([
+  'pane', '窗格', 'group', '组', 'custom', '自定义', 'region', '区域',
+  'client', '客户端', 'unknown', '未知', 'document', '文档',
+])
+// Roles that are inherently interactive/informative even with no extra text.
+const MEANINGFUL_ROLES = new Set([
+  'button', '按钮', 'edit', '编辑', 'menuitem', '菜单项', 'link', '链接', 'hyperlink', '超链接',
+  'checkbox', '复选框', 'radiobutton', '单选按钮', 'combobox', '组合框', 'list', '列表',
+  'listitem', '列表项', 'tab', '选项卡', 'tabitem', 'text', '文本', 'image', '图像',
+  'slider', '滑块', 'spinner', '微调按钮', 'treeitem', '树项目', 'menuitemcheckbox',
+])
+const _TREE_EXTRA_MARKERS = ['Description: ', 'Value: ', 'Secondary Actions: ', 'ID: ']
+
+function parseTreeLine(line) {
+  const match = /^(\t*)(\d+)(?: +([^\s]+))?(.*)$/.exec(line)
+  if (!match) return null
+  return { indent: match[1].length, index: Number(match[2]), role: (match[3] || '').toLowerCase(), rest: (match[4] || ''), raw: line }
+}
+
+/** Does this node carry information (a name, a value/description, or a real role)? */
+function nodeIsMeaningful(node) {
+  if (!node) return false
+  if (MEANINGFUL_ROLES.has(node.role)) return true
+  if (_TREE_EXTRA_MARKERS.some(marker => node.rest.includes(marker))) return true
+  // A name: strip a leading parenthesised state block, then any trailing extras.
+  let text = node.rest.trim()
+  const close = text.startsWith('(') ? text.indexOf(')') : -1
+  if (close !== -1) text = text.slice(close + 1).trim()
+  for (const marker of _TREE_EXTRA_MARKERS) {
+    const at = text.indexOf(marker)
+    if (at !== -1) text = text.slice(0, at).trim()
+  }
+  text = text.replace(/(?:^| )(off|on|indeterminate)$/, '').trim()
+  if (text) return true
+  // A non-generic role with no name still hints at structure worth keeping.
+  return Boolean(node.role) && !GENERIC_CONTAINER_ROLES.has(node.role)
+}
+
+/** Does this node carry actual *content* (a live value/description, not just a label)? */
+function nodeHasContent(node) {
+  if (!node) return false
+  if (node.rest.includes('Value: ') || node.rest.includes('Description: ')) return true
+  // A text/document role that carries a readable name is content too.
+  return (node.role === 'text' || node.role === '文本' || node.role === '文档') && nodeIsMeaningful(node)
+}
+
+/** Is this window's process a known Chromium/WebView2/Electron/WMPF host? (app string only, no shell) */
+export function looksLikeChromiumHost(window) {
+  const app = String(window?.app || '')
+  if (!app) return false
+  return /WeChatAppEx|RadiumWMPF|wmpf|msedgewebview2|webview2|electron|chrome\.exe|chromium|msedge|Microsoft\.Edge|Code\.exe|slack|discord|teams|notion|obsidian/i.test(app)
+}
+
+export function classifyAccessibilityTree(treeText, window) {
+  const lines = String(treeText || '').split('\n')
+  let total = 0
+  let meaningful = 0
+  let contentBearing = 0
+  for (const line of lines) {
+    const node = parseTreeLine(line)
+    if (!node) continue
+    total += 1
+    if (nodeIsMeaningful(node)) meaningful += 1
+    if (nodeHasContent(node)) contentBearing += 1
+  }
+  const ratio = total === 0 ? 1 : meaningful / total
+  // "Dead" means: enough nodes to be a real tree, but NOT ONE content-bearing node —
+  // and either the process is a known Chromium/WebView2/WMPF host (which renders into
+  // a canvas and publishes only window chrome over UIA) or literally nothing is
+  // meaningful. Window-chrome buttons (minimize/close) do NOT count as content, so they
+  // no longer mask a useless tree.
+  const dead = total >= 8 && contentBearing === 0 && (looksLikeChromiumHost(window) || meaningful <= 1)
+  return { total, meaningful, contentBearing, ratio, dead }
+}
+
+/**
+ * Drop decorative leaves while keeping every meaningful node and the ancestor
+ * containers that lead to it. Node indices are untouched, so element_index from
+ * the helper still resolves against the retained lines.
+ */
+export function compressAccessibilityTree(treeText) {
+  const lines = String(treeText || '').split('\n')
+  const nodes = []
+  const nodeLineIndexes = []
+  lines.forEach((line, index) => {
+    const node = parseTreeLine(line)
+    if (node) { nodes.push({ ...node, keep: nodeIsMeaningful(node) }); nodeLineIndexes.push(index) }
+  })
+  if (nodes.length === 0) return treeText
+  // Propagate "has a meaningful descendant" up through the indent stack.
+  const stack = []
+  for (const node of nodes) {
+    while (stack.length && stack[stack.length - 1].indent >= node.indent) stack.pop()
+    if (node.keep) for (const ancestor of stack) ancestor.hasMeaningfulDescendant = true
+    stack.push(node)
+  }
+  const kept = nodes.filter(node => node.keep || node.hasMeaningfulDescendant)
+  if (kept.length === 0) return treeText
+  const dropped = nodes.length - kept.length
+  const firstNodeLine = nodeLineIndexes[0]
+  const lastNodeLine = nodeLineIndexes[nodeLineIndexes.length - 1]
+  const header = lines.slice(0, firstNodeLine)
+  const footer = lines.slice(lastNodeLine + 1)
+  const out = [...header, ...kept.map(node => node.raw), ...footer].join('\n')
+  return dropped > 0
+    ? `${out}\n# (semantic compression: ${dropped} anonymous container node(s) omitted; indices above are unchanged)`
+    : out
+}
+
+/** One explicit verdict that replaces a useless tree. */
+export function deadTreeSignal(classification, cdp) {
+  const lines = [
+    '=== Accessibility tree is UNUSABLE for this window (semantic verdict) ===',
+    `nodes: ${classification.total}, meaningful labels: ${classification.meaningful}, content-bearing: ${classification.contentBearing} — no window content is exposed over UIA, only anonymous containers and window chrome.`,
+    'This window is a Chromium/WebView2 or mini-program (WeChat WMPF/Radium) surface that does not publish its DOM over UIA.',
+    'Do NOT call get_window_state with include_text for this window again (it costs tokens and yields nothing).',
+    'Use screenshots + vision (vision_map / vision_read / vision_zoom) for content, and act by x/y coordinates; element_index / set_value / perform_secondary_action will not work here.',
+  ]
+  if (cdp) {
+    if (cdp.canAttach && cdp.endpoints?.length) {
+      const port = cdp.endpoints[0].port
+      lines.push(`CDP IS reachable on 127.0.0.1:${port} (${cdp.endpoints[0].browser || 'chromium'}); prefer DOM automation: attach chrome-devtools MCP with --browserUrl http://127.0.0.1:${port}.`)
+    } else if (cdp.chromiumLike) {
+      lines.push(`CDP: ${cdp.guidance}`)
+    }
+  }
+  return lines.join('\n')
+}
+
+/** Cache a CDP probe per app so a dead-tree window does not spawn a shell on every observation. */
+async function cachedCdpProbe(state, window, maxAgeMs = 60_000) {
+  if (!window || typeof window.app !== 'string' || !window.app) return null
+  state.cdpProbeCache = state.cdpProbeCache || new Map()
+  const key = window.app
+  const hit = state.cdpProbeCache.get(key)
+  const now = Date.now()
+  if (hit && now - hit.at < maxAgeMs) return hit.value
+  let value = null
+  try { value = await probeCdp({ window }) } catch { value = null }
+  state.cdpProbeCache.set(key, { at: now, value })
+  return value
+}
+
+const UIA_TREE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'uia-tree.ps1')
+
+/** Render a .NET-UIА fallback node list into a readable tree with window-relative bounds. */
+export function formatUiaFallback(nodes) {
+  const lines = [
+    '=== UIA fallback tree (.NET UIAutomation ControlView) ===',
+    'The helper-provided tree under-reported this Chromium/WebView2 window; this is a fuller walk of the same window.',
+    'These nodes have NO helper element_index. Act by x/y using the window-relative bounds shown as {{x,y,w,h}}.',
+    '',
+  ]
+  for (const n of nodes) {
+    const indent = '\t'.repeat(Math.min((n.depth || 0) + 1, 12))
+    const role = n.role || 'Node'
+    const name = n.name ? ` ${n.name}` : ''
+    const value = n.value ? ` Value: ${n.value}` : ''
+    const box = ` {{x:${n.x | 0},y:${n.y | 0},w:${n.w | 0},h:${n.h | 0}}}`
+    lines.push(`${indent}${role}${name}${value}${box}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Walk a window's UIA tree through the bundled .NET script and return nodes with
+ * window-relative bounds. This is the fix for Chromium/WebView2/mini-program windows
+ * (WeChat WMPF, Electron, WebView2) whose tree the native helper under-reports down to
+ * anonymous panes: a .NET UIAutomation ControlView walk DOES reach the Document/Text/
+ * ListItem content and the Document value carries the live URL. Returns null on failure.
+ */
+export function uiaTreeFallback(hwnd, maxNodes = 800) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0) return null
+  try {
+    const raw = execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', UIA_TREE_SCRIPT, '-Hwnd', String(hwnd), '-MaxNodes', String(maxNodes)],
+      { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+    ).trim()
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : [parsed]
+  } catch {
+    return null
+  }
+}
+
+//: Tools whose coordinate form needs a cached capture session from the last
+//: observation; the first observation of a cold/just-restarted helper can leave
+//: that session empty. See {@link recoverCoordinateRefusal}.
+const COORDINATE_TOOLS = new Set(['click', 'scroll', 'drag'])
+
+/**
+ * Recover a coordinate action refused only because no screenshot session was cached
+ * (first observation after helper start) or because the caller's screenshotId was
+ * superseded. The refusal means the action never ran, so a single re-observe + retry
+ * is safe and turns a two-round-trip model dance into zero. Anything else is left
+ * untouched for the caller to see.
+ */
+async function recoverCoordinateRefusal(ctx, state, spec, exec, input, result, turnMeta) {
+  if (!result || result.ok || !result.error) return result
+  if (!COORDINATE_TOOLS.has(spec.name)) return result
+  const message = String(result.error)
+  const recoverable = /none is cached/i.test(message)
+    || /not the latest observation/i.test(message)
+    || /unknown screenshotId/i.test(message)
+  if (!recoverable) return result
+  if (!input || typeof input.window !== 'object' || input.window === null) return result
+  try {
+    const observed = await ctx.dshComputerUse.call(
+      'get_window_state',
+      { window: input.window, include_screenshot: true, include_text: false },
+      exec.signal,
+      turnMeta,
+    )
+    if (!observed || observed.ok === false) return result
+    const value = observed.value !== undefined ? observed.value : observed
+    if (value?.accessibility?.tree) {
+      state.lastElements = extractInteractiveElements(value.accessibility.tree)
+      state.lastWindow = { app: input.window.app, id: input.window.id, title: input.window.title }
+    }
+    const retryInput = { ...input }
+    delete retryInput.screenshotId
+    const retried = await ctx.dshComputerUse.call(spec.name, retryInput, exec.signal, turnMeta)
+    return retried || result
+  } catch {
+    return result
+  }
+}
+
 //: Tools that accept `text` as "the element named X" rather than as a payload.
 //: Mirrors exactly the tools whose schema gets the optional `text` property in
 //: {@link makeSidecarTool}. Every other tool must keep `text` intact:
@@ -380,10 +851,38 @@ function healthTool(ctx, state, config, startError) {
 const TEXT_SELECTOR_TOOLS = new Set(['click', 'set_value', 'perform_secondary_action'])
 
 
+const JSON_SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
+/**
+ * 规范 sidecar 返回的 JSON Schema：新版 harness（dsh-tools assertSupportedJsonSchema）只接受
+ * 合法单值 type。sidecar 可能返回数组 type 或别名，会被整份工具定义拒绝注册（skip）。
+ * 递归修正为合法单值，不改变语义（多类型取首个合法）。
+ */
+function normalizeSchemaTypes(node, path = "schema") {
+  if (node === null || typeof node !== 'object') return
+  if (Array.isArray(node)) { node.forEach((x, i) => normalizeSchemaTypes(x, path + '[' + i + ']')); return }
+  if (node.type !== undefined) {
+    if (Array.isArray(node.type)) {
+      const pick = node.type.find(x => JSON_SCHEMA_TYPES.has(x))
+      console.error('[dsh-computer-use] type[] @' + path + ': ' + JSON.stringify(node.type) + ' -> ' + String(pick))
+      if (pick !== undefined) node.type = pick; else delete node.type
+    } else if (typeof node.type === 'string' && !JSON_SCHEMA_TYPES.has(node.type)) {
+      const MAP = { any: 'string', json: 'object', dynamic: 'string', auto: 'string' }
+      const next = MAP[node.type] ?? "string"
+      console.error('[dsh-computer-use] type @' + path + ': "' + node.type + '" -> "' + next + '"')
+      node.type = next
+    }
+  }
+  if (node.properties && typeof node.properties === 'object') for (const k of Object.keys(node.properties)) normalizeSchemaTypes(node.properties[k], path + '.properties.' + k)
+  if (node.items !== undefined) normalizeSchemaTypes(node.items, path + ".items")
+  for (const key of ['anyOf', 'oneOf', 'allOf']) if (Array.isArray(node[key])) node[key].forEach((x, i) => normalizeSchemaTypes(x, path + '.' + key + '[' + i + ']'))
+  if (node.additionalProperties && typeof node.additionalProperties === 'object') normalizeSchemaTypes(node.additionalProperties, path + '.additionalProperties')
+}
+
 function makeSidecarTool(ctx, spec, config, state, options) {
   const parameters = spec.parameters && typeof spec.parameters === 'object'
     ? JSON.parse(JSON.stringify(spec.parameters))
     : { type: 'object', properties: {}, additionalProperties: true }
+  normalizeSchemaTypes(parameters, 'parameters')
   if (spec.name === 'click') {
     if (parameters.properties && !parameters.properties.text) {
       parameters.properties.text = {
@@ -522,6 +1021,12 @@ function makeSidecarTool(ctx, spec, config, state, options) {
           // an ordinary error and this is not an approval flow (APS-10).
           if (refusal) result = await resolveRefusal(ctx, config, state, spec, exec, input, turnMeta, refusal)
         }
+        // First-observation usability: a coordinate click/scroll/drag can be refused
+        // because the previous get_window_state cached no capture session (a cold or
+        // just-restarted helper), or because the caller passed a screenshotId that a
+        // newer observation superseded. Both are recoverable without the model
+        // re-deriving the plan: re-observe once, drop the stale screenshotId, retry.
+        result = await recoverCoordinateRefusal(ctx, state, spec, exec, input, result, turnMeta)
       } finally {
         if (gate?.write) safety.finishWrite()
       }
@@ -530,12 +1035,63 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       result = deriveAudioResult(result, spec.name)
       const value = result?.value ?? result
       if (spec.name === 'get_window_state' && value?.accessibility?.tree) {
-        state.lastElements = extractInteractiveElements(value.accessibility.tree)
-        // Remember which window those indices describe (audit P1-4): text
-        // selection must never resolve against another window's observation.
-        state.lastWindow = input && typeof input.window === 'object'
-          ? { app: input.window.app, id: input.window.id, title: input.window.title }
-          : null
+        const classification = classifyAccessibilityTree(value.accessibility.tree, input && input.window)
+        if (classification.dead) {
+          // The helper's tree has no content for this window. Before declaring the
+          // path dead, try the .NET UIAutomation ControlView fallback: for Chromium/
+          // WebView2/mini-program windows the helper under-reports, but a ControlView
+          // walk DOES reach Document/Text/ListItem (and the Document value is the URL).
+          const hwnd = Number(input?.window?.id)
+          const fallback = uiaTreeFallback(hwnd)
+          if (Array.isArray(fallback) && fallback.length >= 3) {
+            value.accessibility.tree = formatUiaFallback(fallback)
+            value.accessibility.semantic = {
+              dead: false,
+              source: 'uia-dotnet-fallback',
+              nodes: fallback.length,
+              helperNodes: classification.total,
+            }
+            // No helper element_index here: leave lastElements empty so a stray
+            // element_index cannot resolve against a fallback line. Act by x/y.
+            state.lastElements = []
+            state.lastWindow = input && typeof input.window === 'object'
+              ? { app: input.window.app, id: input.window.id, title: input.window.title }
+              : null
+          } else {
+            // Both the helper tree AND the .NET fallback are empty/blocked: emit the
+            // explicit "this path is dead" verdict (with a cached CDP probe) so the
+            // model stops wasting tokens and switches to vision + pixel input.
+            const cdp = await cachedCdpProbe(state, input && input.window)
+            value.accessibility.tree = deadTreeSignal(classification, cdp)
+            value.accessibility.semantic = {
+              dead: true,
+              totalNodes: classification.total,
+              meaningfulNodes: classification.meaningful,
+              fallbackTried: true,
+              cdpAttachable: Boolean(cdp && cdp.canAttach),
+            }
+            state.lastElements = []
+            state.lastWindow = input && typeof input.window === 'object'
+              ? { app: input.window.app, id: input.window.id, title: input.window.title }
+              : null
+          }
+        } else {
+          // Semantic compression: drop decorative anonymous leaves, keep the
+          // structure that leads to real content (indices unchanged).
+          const compressed = compressAccessibilityTree(value.accessibility.tree)
+          value.accessibility.tree = compressed
+          value.accessibility.semantic = {
+            dead: false,
+            totalNodes: classification.total,
+            meaningfulNodes: classification.meaningful,
+          }
+          state.lastElements = extractInteractiveElements(compressed)
+          // Remember which window those indices describe (audit P1-4): text
+          // selection must never resolve against another window's observation.
+          state.lastWindow = input && typeof input.window === 'object'
+            ? { app: input.window.app, id: input.window.id, title: input.window.title }
+            : null
+        }
       }
       const refs = await admitImages(ctx, result?.images || [])
       return { value, images: refs }
