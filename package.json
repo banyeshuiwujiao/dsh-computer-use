@@ -56,12 +56,12 @@
     "codexBaseline": "26.903.61454"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^0.1.6",
-    "@deepseek-ai/dsh-tools": "^0.1.6",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.6",
-    "@deepseek-ai/dsh-user-approval": "^0.1.6",
-    "@deepseek-ai/dsh-attachment": "^0.1.6",
-    "@deepseek-ai/schemastery": "^0.1.6"
+    "@deepseek-ai/cordis": "^0.1.6 || ^0.2.0",
+    "@deepseek-ai/dsh-tools": "^0.1.6 || ^0.2.0",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.6 || ^0.2.0",
+    "@deepseek-ai/dsh-user-approval": "^0.1.6 || ^0.2.0",
+    "@deepseek-ai/dsh-attachment": "^0.1.6 || ^0.2.0",
+    "@deepseek-ai/schemastery": "^0.1.6 || ^0.2.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-user-approval": {
