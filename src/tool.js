@@ -1124,6 +1124,8 @@ export function isWedged(state, app) {
  */
 export function friendlyActionError(state, input, rawMessage) {
   const msg = String(rawMessage == null ? '' : rawMessage)
+  // Already carries actionable guidance (e.g. the Rust helper now appends it) — don't double it.
+  if (/call list_windows/i.test(msg)) return null
   if (/window id \d+ was not found|was not found|IdGone|window .*?not found|window is gone|window was closed/i.test(msg)) {
     state.lastElements = []
     state.lastWindow = null

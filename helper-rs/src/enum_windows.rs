@@ -862,7 +862,10 @@ pub fn enum_windows() -> Result<Vec<WindowRef>, Error> {
 }
 
 pub fn missing_window_message(id: u64, windows: &[WindowRef]) -> String {
-    format!("window id {id:?} was not found. Current windows: {windows:?}")
+    // Keep the official "window id … was not found. Current windows: …" prefix intact
+    // (parity checks match it) and append an actionable hint so a model knows to
+    // re-locate the window instead of retrying blindly.
+    format!("window id {id:?} was not found. Current windows: {windows:?} — the target window appears CLOSED or gone; call list_windows to re-locate it, then retry.")
 }
 
 pub fn owner_changed_message(id: u64, expected: &str, actual: &str) -> String {
@@ -1484,7 +1487,7 @@ mod tests {
         }];
         assert_eq!(
             missing_window_message(99, &current),
-            "window id 99 was not found. Current windows: [Window { app: \"notepad.exe\", id: 42, title: \"Untitled\" }]"
+            "window id 99 was not found. Current windows: [Window { app: \"notepad.exe\", id: 42, title: \"Untitled\" }] — the target window appears CLOSED or gone; call list_windows to re-locate it, then retry."
         );
         assert_eq!(
             owner_changed_message(42, "chrome.exe", "notepad.exe"),
@@ -1503,7 +1506,7 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("Current windows: [") || err.message.ends_with("Current windows: []"),
+            err.message.contains("Current windows: ["),
             "{}",
             err.message
         );
