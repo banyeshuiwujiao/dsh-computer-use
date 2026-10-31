@@ -793,29 +793,39 @@ export function waitUntilTool(ctx, state) {
       let baseHash = null
       while (true) {
         polls += 1
-        // Screenshot only when we need a change hash; text comes from the fallback for
-        // Chromium hosts (fast, avoids the helper's 15s a11y dump).
-        const res = await ctx.dshComputerUse.call(
-          'get_window_state',
-          { window: win, include_screenshot: Boolean(wantChange), include_text: wantText && !chromium },
-          exec.signal, turnMeta,
-        )
-        const val = res && res.value !== undefined ? res.value : res
+        let val = null
         if (wantChange) {
+          // Need a screenshot hash; text (if also asked) comes from the fallback for
+          // Chromium hosts, so only ask the helper for text on non-Chromium windows.
+          const res = await ctx.dshComputerUse.call(
+            'get_window_state',
+            { window: win, include_screenshot: true, include_text: wantText && !chromium },
+            exec.signal, turnMeta,
+          )
+          val = res && res.value !== undefined ? res.value : res
           const img = (res && Array.isArray(res.images) ? res.images : [])[0]
           if (img && img.data) {
             const h = crypto.createHash('sha1').update(String(img.data)).digest('hex')
             if (baseHash === null) baseHash = h
             else if (h !== baseHash) return { value: { satisfied: true, reason: 'screen-changed', waitedMs: Date.now() - start, polls } }
           }
+        } else if (wantText && !chromium) {
+          // Non-Chromium: ask the helper for its accessibility tree directly.
+          const res = await ctx.dshComputerUse.call(
+            'get_window_state',
+            { window: win, include_screenshot: false, include_text: true },
+            exec.signal, turnMeta,
+          )
+          val = res && res.value !== undefined ? res.value : res
         }
+        // (Chromium text-only: skip get_window_state entirely and read the .NET fallback.)
         if (wantText) {
           let tree = val && val.accessibility && typeof val.accessibility.tree === 'string' ? val.accessibility.tree : ''
           if (!tree && chromium) {
             const fb = uiaTreeFallback(Number(win && win.id))
             if (Array.isArray(fb) && fb.length) tree = formatUiaFallback(fb)
           }
-          if (tree.includes(args.text)) return { value: { satisfied: true, reason: 'text-appeared', waitedMs: Date.now() - start, polls } }
+          if (tree && tree.includes(args.text)) return { value: { satisfied: true, reason: 'text-appeared', waitedMs: Date.now() - start, polls } }
         }
         if (Date.now() - start >= timeout) return { value: { satisfied: false, reason: 'timeout', waitedMs: Date.now() - start, polls } }
         await sleepRespectingSignal(interval, exec.signal)
@@ -1367,15 +1377,21 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       // in the middle of this one. The idle clock restarts when the write
       // *finishes*, not when it was accepted.
       let result
+      let captureFailed = false
       translateScreenshotId(state, input)
+      const wantText = spec.name === 'get_window_state' && Boolean(input && input.include_text)
+      const wantShot = spec.name === 'get_window_state'
+        ? (input && input.include_screenshot === undefined ? true : Boolean(input && input.include_screenshot))
+        : false
+      const chromium = looksLikeChromiumHost(input && input.window)
       // Serve accessibility text from the .NET ControlView fallback (richer, fast, no
-      // 15s helper dump) when the window is a Chromium/WebView2 host OR when this app
-      // is already wedged/latched to the fallback. That includes the "first wedge →
-      // permanently fall back this session" latch (config fallbackLatchAfterWedge).
-      const textViaFallback = spec.name === 'get_window_state'
-        && Boolean(input && input.include_text)
-        && (looksLikeChromiumHost(input && input.window)
-          || isWedged(state, input && input.window && input.window.app))
+      // 15s helper dump) when the window is a Chromium/WebView2 host OR when this app is
+      // already wedged/latched to the fallback.
+      const textViaFallback = wantText && (chromium || isWedged(state, input && input.window && input.window.app))
+      // Pure text-only observation of a Chromium host: never touch the helper/capture at
+      // all — read the .NET fallback directly. This keeps DRM/hardware-overlay windows
+      // (where WGC capture times out) observable and yields a valid observation lease.
+      const textOnlySkipHelper = spec.name === 'get_window_state' && wantText && !wantShot && chromium
       const region = spec.name === 'get_window_state' ? normalizeRegion(input && input.region) : null
       const callInput = (() => {
         const c = textViaFallback ? { ...input, include_text: false } : { ...input }
@@ -1384,25 +1400,35 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       })()
       if (gate?.write) safety.beginWrite()
       try {
-        try {
-          result = await ctx.dshComputerUse.call(spec.name, callInput, exec.signal, turnMeta)
-        } catch (thrown) {
-          const thrownMsg = thrown && thrown.message ? thrown.message : String(thrown)
-          throw friendlyActionError(state, input, thrownMsg) || thrown
+        if (textOnlySkipHelper) {
+          result = { ok: true, value: { accessibility: null }, images: [] }
+        } else {
+          try {
+            result = await ctx.dshComputerUse.call(spec.name, callInput, exec.signal, turnMeta)
+          } catch (thrown) {
+            const thrownMsg = thrown && thrown.message ? thrown.message : String(thrown)
+            if (spec.name === 'get_window_state' && /capture timed out|window capture timed out/i.test(thrownMsg)) {
+              // DRM/overlay windows cannot be captured; fall back to text-only rather than failing.
+              captureFailed = true
+              result = { ok: true, value: { accessibility: null }, images: [] }
+            } else {
+              throw friendlyActionError(state, input, thrownMsg) || thrown
+            }
+          }
+          if (result && result.approvalRequest) {
+            const refusal = normalizeApprovalRequest(result.approvalRequest)
+            // Official helper_transport.js only treats the payload as an approval when
+            // "app" is a non-empty string after trimming; otherwise the helper returned
+            // an ordinary error and this is not an approval flow (APS-10).
+            if (refusal) result = await resolveRefusal(ctx, config, state, spec, exec, input, turnMeta, refusal)
+          }
+          // First-observation usability: a coordinate click/scroll/drag can be refused
+          // because the previous get_window_state cached no capture session (a cold or
+          // just-restarted helper), or because the caller passed a stale screenshotId, or
+          // because the window bounds changed (RDP resize). All are recoverable without
+          // the model re-deriving the plan: re-observe once, drop the stale id, retry.
+          result = await recoverCoordinateRefusal(ctx, state, spec, exec, input, result, turnMeta)
         }
-        if (result && result.approvalRequest) {
-          const refusal = normalizeApprovalRequest(result.approvalRequest)
-          // Official helper_transport.js only treats the payload as an approval when
-          // "app" is a non-empty string after trimming; otherwise the helper returned
-          // an ordinary error and this is not an approval flow (APS-10).
-          if (refusal) result = await resolveRefusal(ctx, config, state, spec, exec, input, turnMeta, refusal)
-        }
-        // First-observation usability: a coordinate click/scroll/drag can be refused
-        // because the previous get_window_state cached no capture session (a cold or
-        // just-restarted helper), or because the caller passed a stale screenshotId, or
-        // because the window bounds changed (RDP resize). All are recoverable without
-        // the model re-deriving the plan: re-observe once, drop the stale id, retry.
-        result = await recoverCoordinateRefusal(ctx, state, spec, exec, input, result, turnMeta)
       } finally {
         if (gate?.write) safety.finishWrite()
       }
@@ -1470,6 +1496,11 @@ function makeSidecarTool(ctx, spec, config, state, options) {
           if (!value.accessibility || typeof value.accessibility !== 'object') value.accessibility = {}
           value.accessibility.guidance = 'UIA provider is wedged/unavailable for this window. The SCREENSHOT IS STILL VALID — act by x/y coordinates; accessibility text is unavailable right now.'
           value.accessibility.semantic = { dead: false, source: 'none-wedged' }
+        }
+        if (captureFailed) {
+          if (!value.accessibility || typeof value.accessibility !== 'object') value.accessibility = {}
+          value.accessibility.guidance = 'Screenshot unavailable (capture timed out — likely a DRM/hardware-overlay video surface). Text is served from the UIA fallback; keyboard shortcuts still work, but coordinate clicks need a screenshot.'
+          value.captureFailed = true
         }
       }
       // Region crop (token saving): crop each captured frame to the requested rectangle.
