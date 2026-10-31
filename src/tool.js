@@ -712,6 +712,9 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps) {
     const r = await ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
     if (!r || r.ok === false) break
     done += 1
+    // Space out pulses: many apps coalesce rapid wheel events into a single scroll, so a
+    // tight loop only moves a handful of pages. A short gap lets each pulse register.
+    if (i + 1 < steps) await new Promise((resolve) => setTimeout(resolve, 70))
   }
   return { tool: 'scroll_to', to, percent, stepsDone: done, perStep, at: { x, y } }
 }
