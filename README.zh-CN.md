@@ -186,11 +186,11 @@ flowchart TB
 |---|---|---|
 | `batch_actions` | 开启 | 一次调用执行一串确定性动作，然后做一次 `get_window_state` |
 | `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计 |
-| `uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树 |
-| `wait` | 开启 | 固定等待（可选顺带重新观察），不占一次 helper 往返 |
-| `wait_until` | 开启 | 轮询到文本出现 / 截图变化 / 超时为止 |
-| `scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲） |
-| `reach_last_page` | 开启 | 用更大的脉冲预算一次滚到最后一页——分页阅读器/PDF 查看器的首选 |
+| `computer_use_uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树 |
+| `computer_use_wait` | 开启 | 固定等待（可选顺带重新观察），不占一次 helper 往返 |
+| `computer_use_wait_until` | 开启 | 轮询到文本出现 / 截图变化 / 超时为止 |
+| `computer_use_scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲） |
+| `computer_use_reach_last_page` | 开启 | 用更大的脉冲预算一次滚到最后一页——分页阅读器/PDF 查看器的首选 |
 | `computer_use_documents` | 开启 | 导出活动文档 URL（`Document` 角色的 ValuePattern），PDF/查看器课件可直接取内容而不必逐页翻 |
 | `computer_use_cdp_probe` | 开启 | 只读探测：窗口是否为 Chromium 宿主、CDP 端点是否可达——用于判定"能不能走 DOM 自动化"（微信 WMPF/Radium 不行） |
 | `click_element`、`scroll_element` | 需显式开启 | 旧版 window-v1 别名 |
@@ -421,7 +421,7 @@ DSH官方的Computer Use采用设计思路不大一致。如果希望使用Codex
 
 - Chromium 宿主上 `get_window_state` 只取文本（`include_text: true`、不要截图）时**完全不走捕获通道**，直接读 .NET UIA 兜底，同时仍然拿到有效观察租约。
 - `get_window_state` 遇到捕获超时会**降级成纯文本**并返回 `captureFailed: true` + 提示，而不是整个调用失败。
-- `uia_act` 按元素名用 UIA pattern 操作控件，既不需要帧也不需要坐标——WebView2 里的表单/考试界面走这条最稳。
+- `computer_use_uia_act` 按元素名用 UIA pattern 操作控件，既不需要帧也不需要坐标——WebView2 里的表单/考试界面走这条最稳。
 
 另外，**比桌面还大**的窗口同样合成不了；先把它缩到屏幕内再期待截图。
 

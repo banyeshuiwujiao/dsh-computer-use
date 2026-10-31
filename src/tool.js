@@ -284,7 +284,7 @@ async function registerDesktop(ctx, state, config) {
     }
   }
   state.exposedNames = exposed.map(spec => spec.name)
-    .concat(['wait', 'computer_use_cdp_probe', 'scroll_to', 'reach_last_page', 'wait_until', 'computer_use_documents', 'uia_act'])
+    .concat(['computer_use_wait', 'computer_use_cdp_probe', 'computer_use_scroll_to', 'computer_use_reach_last_page', 'computer_use_wait_until', 'computer_use_documents', 'computer_use_uia_act'])
     .filter((name, index, all) => all.indexOf(name) === index)
   publishToolNames(ctx, state)
 }
@@ -433,7 +433,7 @@ function sleepRespectingSignal(ms, signal) {
  */
 function waitTool(ctx, state) {
   return defineTool({
-    name: 'wait',
+    name: 'computer_use_wait',
     description:
       'Wait a fixed duration without a helper round-trip. Use it for auto-playing media, animations, debounced UI, '
       + 'or between polls. Set observe:true with a window to also take a fresh get_window_state (screenshot, and '
@@ -480,7 +480,7 @@ function waitTool(ctx, state) {
       return { value: out, images: [] }
     },
     isConcurrencySafe() { return true },
-    presentCall(args) { return { card: 'generic', title: 'wait', rawInput: args && typeof args === 'object' ? args : {} } },
+    presentCall(args) { return { card: 'generic', title: 'computer_use_wait', rawInput: args && typeof args === 'object' ? args : {} } },
   })
 }
 
@@ -748,12 +748,12 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps) {
     // tight loop only moves a handful of pages. A short gap lets each pulse register.
     if (i + 1 < steps) await new Promise((resolve) => setTimeout(resolve, 70))
   }
-  return { tool: 'scroll_to', to, percent, stepsDone: done, perStep, at: { x, y } }
+  return { tool: 'computer_use_scroll_to', to, percent, stepsDone: done, perStep, at: { x, y } }
 }
 
 export function scrollToTool(ctx, state) {
   return defineTool({
-    name: 'scroll_to',
+    name: 'computer_use_scroll_to',
     description:
       'Scroll a window to the bottom (default) or top, or toward an approximate percent, in ONE call by issuing '
       + 'several SEQUENTIAL wheel scrolls. This replaces the "one scroll per round-trip" dance and avoids the batch '
@@ -772,15 +772,15 @@ export function scrollToTool(ctx, state) {
       return { value: await runScrollTo(ctx, state, args && typeof args === 'object' ? args : {}, exec, 12) }
     },
     isConcurrencySafe() { return false },
-    presentCall(a) { return { card: 'generic', title: 'scroll_to', rawInput: a && typeof a === 'object' ? a : {} } },
+    presentCall(a) { return { card: 'generic', title: 'computer_use_scroll_to', rawInput: a && typeof a === 'object' ? a : {} } },
   })
 }
 
 export function reachLastPageTool(ctx, state) {
   return defineTool({
-    name: 'reach_last_page',
+    name: 'computer_use_reach_last_page',
     description:
-      'Scroll a long document to its LAST page in one call (a scroll_to(bottom) with a bigger default pulse budget). '
+      'Scroll a long document to its LAST page in one call (a computer_use_scroll_to(bottom) with a bigger default pulse budget). '
       + 'For readers/viewers that only count completion when the last page is reached.',
     parameters: {
       window: WIN_PARAM,
@@ -796,13 +796,13 @@ export function reachLastPageTool(ctx, state) {
       return { value: await runScrollTo(ctx, state, a, exec, 40) }
     },
     isConcurrencySafe() { return false },
-    presentCall(a) { return { card: 'generic', title: 'reach_last_page', rawInput: a && typeof a === 'object' ? a : {} } },
+    presentCall(a) { return { card: 'generic', title: 'computer_use_reach_last_page', rawInput: a && typeof a === 'object' ? a : {} } },
   })
 }
 
 export function waitUntilTool(ctx, state) {
   return defineTool({
-    name: 'wait_until',
+    name: 'computer_use_wait_until',
     description:
       'Poll a window until a condition is met instead of a blind fixed sleep: waits until `text` appears in the '
       + 'accessibility tree, or until the screenshot `change`s from the first frame. Returns {satisfied, reason, waitedMs, polls}.',
@@ -867,7 +867,7 @@ export function waitUntilTool(ctx, state) {
       }
     },
     isConcurrencySafe() { return false },
-    presentCall(a) { return { card: 'generic', title: 'wait_until', rawInput: a && typeof a === 'object' ? a : {} } },
+    presentCall(a) { return { card: 'generic', title: 'computer_use_wait_until', rawInput: a && typeof a === 'object' ? a : {} } },
   })
 }
 
@@ -1125,7 +1125,7 @@ export function uiaActFallback(hwnd, name, action) {
 /** `uia_act` — act by element name (UIA patterns), then optionally re-observe. */
 export function uiaActTool(ctx, state) {
   return defineTool({
-    name: 'uia_act',
+    name: 'computer_use_uia_act',
     description:
       'Act on this window by ELEMENT NAME using UIA patterns (Select/Invoke) — no screenshot and no coordinates, '
       + 'so it works on static windows that Windows Graphics Capture cannot capture (exam/form pages in WeChat/WebView2). '
@@ -1172,7 +1172,7 @@ export function uiaActTool(ctx, state) {
       return { value }
     },
     isConcurrencySafe() { return false },
-    presentCall(a) { return { card: 'generic', title: 'uia_act', rawInput: a && typeof a === 'object' ? a : {} } },
+    presentCall(a) { return { card: 'generic', title: 'computer_use_uia_act', rawInput: a && typeof a === 'object' ? a : {} } },
   })
 }
 

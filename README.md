@@ -186,11 +186,11 @@ flowchart TB
 |---|---|---|
 | `batch_actions` | enabled | Deterministic actions in one call, then one `get_window_state` |
 | `computer_use_health` | always | Backend, allow list, documentation gate, environment audit |
-| `uia_act` | enabled | Act on a control **by element name** through UIA patterns (`SelectionItem`/`Invoke`/`LegacyIAccessible`); no screenshot and no coordinates, so it also works on static windows WGC cannot capture. Chain steps with `"A、选项|下一题"`; returns the resulting text tree |
-| `wait` | enabled | Fixed delay (optionally re-observing) without a helper round trip |
-| `wait_until` | enabled | Poll until text appears in the accessibility tree, or until the screenshot changes, or until a timeout |
-| `scroll_to` | enabled | Scroll to bottom/top/an approximate percent by issuing several sequential wheel pulses (70 ms apart, because apps coalesce rapid pulses) |
-| `reach_last_page` | enabled | Scroll to the last page with a larger pulse budget — the one call for paginated viewers/PDF readers |
+| `computer_use_uia_act` | enabled | Act on a control **by element name** through UIA patterns (`SelectionItem`/`Invoke`/`LegacyIAccessible`); no screenshot and no coordinates, so it also works on static windows WGC cannot capture. Chain steps with `"A、选项|下一题"`; returns the resulting text tree |
+| `computer_use_wait` | enabled | Fixed delay (optionally re-observing) without a helper round trip |
+| `computer_use_wait_until` | enabled | Poll until text appears in the accessibility tree, or until the screenshot changes, or until a timeout |
+| `computer_use_scroll_to` | enabled | Scroll to bottom/top/an approximate percent by issuing several sequential wheel pulses (70 ms apart, because apps coalesce rapid pulses) |
+| `computer_use_reach_last_page` | enabled | Scroll to the last page with a larger pulse budget — the one call for paginated viewers/PDF readers |
 | `computer_use_documents` | enabled | Export live document URLs (`Document` role ValuePattern) so PDF/viewer courseware can be read without scrolling page by page |
 | `computer_use_cdp_probe` | enabled | Detect whether a window is a Chromium host and whether a CDP endpoint is reachable — read-only, tells you when DOM automation is impossible (WeChat WMPF/Radium) |
 | `click_element`, `scroll_element` | opt-in | Legacy window-v1 aliases |
@@ -430,7 +430,7 @@ The official DSH Computer Use follows a noticeably different design. Use this pl
 
 - `get_window_state` with `include_text` and **no** screenshot on a Chromium host reads the .NET UIA fallback directly and never touches the capture path (also earns a valid observation lease).
 - `get_window_state` turns a capture timeout into a text-only answer plus `captureFailed: true` and a guidance line, instead of failing the call.
-- `uia_act` drives controls by name through UIA patterns, which needs neither a frame nor coordinates — the reliable path for form/exam UIs in WebView2 hosts.
+- `computer_use_uia_act` drives controls by name through UIA patterns, which needs neither a frame nor coordinates — the reliable path for form/exam UIs in WebView2 hosts.
 
 A window bigger than the desktop also cannot be composited; resize it to fit before expecting screenshots.
 
