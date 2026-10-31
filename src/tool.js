@@ -658,9 +658,25 @@ export function normalizeRegion(region) {
   return { x, y, width, height }
 }
 
-export function cropImageBase64(base64, mimeType, region) {
+/**
+ * Crop a captured frame to a window-relative rectangle.
+ *
+ * The captured frame's pixel (0,0) is NOT necessarily window (0,0): the helper
+ * reports `originX`/`originY` (typically -8/-8 for the invisible window border).
+ * Cropping must therefore subtract that origin and clamp inside the frame,
+ * otherwise a rectangle near the bottom edge collapses to a 1-pixel strip.
+ */
+export function cropImageBase64(base64, mimeType, region, origin, frame) {
   const rg = normalizeRegion(region)
   if (!rg || !base64) return null
+  const ox = origin && Number.isFinite(origin.x) ? origin.x : 0
+  const oy = origin && Number.isFinite(origin.y) ? origin.y : 0
+  let x = Math.max(0, Math.round(rg.x - ox))
+  let y = Math.max(0, Math.round(rg.y - oy))
+  let w = Math.round(rg.width)
+  let h = Math.round(rg.height)
+  if (frame && Number.isFinite(frame.width)) w = Math.min(w, Math.max(1, frame.width - x))
+  if (frame && Number.isFinite(frame.height)) h = Math.min(h, Math.max(1, frame.height - y))
   const inExt = /png/i.test(String(mimeType || '')) ? 'png' : 'jpg'
   let dir = null
   try {
@@ -671,7 +687,7 @@ export function cropImageBase64(base64, mimeType, region) {
     execFileSync('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', CROP_SCRIPT,
       '-InPath', inPath, '-OutPath', outPath,
-      '-X', String(rg.x), '-Y', String(rg.y), '-W', String(rg.width), '-H', String(rg.height),
+      '-X', String(x), '-Y', String(y), '-W', String(w), '-H', String(h),
     ], { timeout: 15_000, windowsHide: true })
     return fs.readFileSync(outPath).toString('base64')
   } catch {
@@ -705,12 +721,27 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps) {
   const steps = Math.min(Math.max(Math.trunc(args.steps ?? defaultSteps), 1), 80)
   const perStep = Math.min(Math.max(Math.trunc(args.delta ?? 12000), 200), 60000) * (to === 'top' ? -1 : 1)
   const meta = state && state.lastShotMeta
-  const x = Number.isFinite(args.x) ? args.x : Math.round(((meta && meta.width) || 800) / 2)
-  const y = Number.isFinite(args.y) ? args.y : Math.round(((meta && meta.height) || 600) / 2)
+  let x = Number.isFinite(args.x) ? args.x : Math.round(((meta && meta.width) || 800) / 2) + (Number.isFinite(meta && meta.originX) ? meta.originX : 0)
+  let y = Number.isFinite(args.y) ? args.y : Math.round(((meta && meta.height) || 600) / 2) + (Number.isFinite(meta && meta.originY) ? meta.originY : 0)
   const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
   let done = 0
   for (let i = 0; i < steps; i += 1) {
-    const r = await ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
+    let r
+    try {
+      r = await ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
+    } catch (err) {
+      // The cached screenshot geometry can predate a resize/maximise (stale centre →
+      // "point … is outside viewport { originX, originY, width, height }"). The error
+      // carries the live viewport, so re-centre from it and retry once.
+      const msg = String(err && err.message ? err.message : err)
+      const m = /outside viewport \{\s*originX:\s*(-?[\d.]+),\s*originY:\s*(-?[\d.]+),\s*width:\s*([\d.]+),\s*height:\s*([\d.]+)/.exec(msg)
+      if (!m) throw err
+      const [ox, oy, vw, vh] = m.slice(1, 5).map(Number)
+      x = Math.round(ox + vw / 2)
+      y = Math.round(oy + vh / 2)
+      if (state) state.lastShotMeta = { ...(state.lastShotMeta || {}), originX: ox, originY: oy, width: vw, height: vh }
+      r = await ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
+    }
     if (!r || r.ok === false) break
     done += 1
     // Space out pulses: many apps coalesce rapid wheel events into a single scroll, so a
@@ -1582,7 +1613,7 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         const cropped = []
         for (const im of result.images) {
           if (!im || !im.data) { cropped.push(im); continue }
-          const out = cropImageBase64(im.data, im.mimeType, region)
+          const out = cropImageBase64(im.data, im.mimeType, region, { x: im.originX, y: im.originY }, { width: im.width, height: im.height })
           cropped.push(out ? { ...im, data: out, mimeType: 'image/png' } : im)
         }
         result.images = cropped
