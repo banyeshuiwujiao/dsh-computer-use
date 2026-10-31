@@ -1137,7 +1137,7 @@ export function uiaActTool(ctx, state) {
       action: { type: 'string', description: '"auto" (default), "select", "invoke" or "legacy".' },
       observe: { type: 'boolean', description: 'Re-read the window text after acting (default true).' },
     },
-    output: OUTPUT_SCHEMA,
+    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
     async execute(args, exec) {
       const win = args && args.window
       const hwnd = Number(win && win.id)
