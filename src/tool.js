@@ -274,6 +274,7 @@ async function registerDesktop(ctx, state, config) {
   ctx.tools.register(reachLastPageTool(ctx, state))
   ctx.tools.register(waitUntilTool(ctx, state))
   ctx.tools.register(documentsTool(ctx, state))
+  ctx.tools.register(uiaActTool(ctx, state))
   const exposed = desktops.concat(extras)
   for (const spec of exposed) {
     try {
@@ -283,7 +284,7 @@ async function registerDesktop(ctx, state, config) {
     }
   }
   state.exposedNames = exposed.map(spec => spec.name)
-    .concat(['wait', 'computer_use_cdp_probe', 'scroll_to', 'reach_last_page', 'wait_until', 'computer_use_documents'])
+    .concat(['wait', 'computer_use_cdp_probe', 'scroll_to', 'reach_last_page', 'wait_until', 'computer_use_documents', 'uia_act'])
     .filter((name, index, all) => all.indexOf(name) === index)
   publishToolNames(ctx, state)
 }
@@ -1022,6 +1023,7 @@ async function cachedCdpProbe(state, window, maxAgeMs = 60_000) {
 }
 
 const UIA_TREE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'uia-tree.ps1')
+const UIA_ACT_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'uia-act.ps1')
 
 /** Render a .NET-UIА fallback node list into a readable tree with window-relative bounds. */
 export function formatUiaFallback(nodes) {
@@ -1063,6 +1065,75 @@ export function uiaTreeFallback(hwnd, maxNodes = 800) {
   } catch {
     return null
   }
+}
+
+/**
+ * Drive a control through a UIA pattern instead of a coordinate click.
+ *
+ * Windows Graphics Capture only produces a frame when the window repaints, so a
+ * static page (exam/form) cannot be screenshot, and coordinate input is refused.
+ * The same .NET UIAutomation walk used for the text fallback can Select/Invoke
+ * controls directly, which is what these H5 pages need.
+ */
+export function uiaActFallback(hwnd, name, action) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0 || !name) return { ok: false, error: 'bad arguments' }
+  try {
+    const raw = execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', UIA_ACT_SCRIPT,
+        '-Hwnd', String(hwnd), '-Name', String(name), '-Action', String(action || 'auto')],
+      { encoding: 'utf8', timeout: 25_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+    ).trim()
+    const line = raw.split(/\r?\n/).find((l) => l.trim().startsWith('{'))
+    return line ? JSON.parse(line) : { ok: false, error: raw || 'no output' }
+  } catch (err) {
+    return { ok: false, error: String(err && err.message ? err.message : err) }
+  }
+}
+
+/** `uia_act` — act by element name (UIA patterns), then optionally re-observe. */
+export function uiaActTool(ctx, state) {
+  return defineTool({
+    name: 'uia_act',
+    description:
+      'Act on this window by ELEMENT NAME using UIA patterns (Select/Invoke) — no screenshot and no coordinates, '
+      + 'so it works on static windows that Windows Graphics Capture cannot capture (exam/form pages in WeChat/WebView2). '
+      + 'Pass several names separated by "|" to run them in order (e.g. "A、选项文本|下一题"). '
+      + 'Returns the resulting text tree so the next step can be planned in the same call.',
+    parameters: {
+      window: WIN_PARAM,
+      names: { type: 'string', description: 'Element name(s); a distinctive substring is enough. Separate several steps with "|".', required: true },
+      action: { type: 'string', description: '"auto" (default), "select", "invoke" or "legacy".' },
+      observe: { type: 'boolean', description: 'Re-read the window text after acting (default true).' },
+    },
+    output: OUTPUT_SCHEMA,
+    async execute(args, exec) {
+      const win = args && args.window
+      const hwnd = Number(win && win.id)
+      const steps = String((args && args.names) || '').split('|').map((s) => s.trim()).filter(Boolean)
+      if (!steps.length) throw new Error('names is required (use "|" to chain several steps)')
+      const acted = []
+      for (const step of steps) {
+        const res = uiaActFallback(hwnd, step, args && args.action)
+        acted.push({ name: step, ok: Boolean(res && res.ok), action: res && res.action, matched: res && res.matched, error: res && res.error })
+        // Let the page settle between steps (select → next happens on click).
+        await new Promise((resolve) => setTimeout(resolve, 260))
+      }
+      const value = { acted, ok: acted.every((a) => a.ok) }
+      const wantObserve = args && args.observe !== false
+      if (wantObserve) {
+        const nodes = uiaTreeFallback(hwnd, 400)
+        if (Array.isArray(nodes) && nodes.length) {
+          value.accessibility = { tree: formatUiaFallback(nodes), semantic: { dead: false, source: 'uia-dotnet-fallback', nodes: nodes.length } }
+          state.lastElements = extractInteractiveElements(formatUiaFallback(nodes))
+          state.lastWindow = { app: win.app, id: win.id, title: win.title }
+        }
+      }
+      return { value }
+    },
+    isConcurrencySafe() { return false },
+    presentCall(a) { return { card: 'generic', title: 'uia_act', rawInput: a && typeof a === 'object' ? a : {} } },
+  })
 }
 
 // ---------------------------------------------------------------------------
