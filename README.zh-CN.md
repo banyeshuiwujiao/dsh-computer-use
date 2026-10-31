@@ -186,6 +186,13 @@ flowchart TB
 |---|---|---|
 | `batch_actions` | 开启 | 一次调用执行一串确定性动作，然后做一次 `get_window_state` |
 | `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计 |
+| `uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树 |
+| `wait` | 开启 | 固定等待（可选顺带重新观察），不占一次 helper 往返 |
+| `wait_until` | 开启 | 轮询到文本出现 / 截图变化 / 超时为止 |
+| `scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲） |
+| `reach_last_page` | 开启 | 用更大的脉冲预算一次滚到最后一页——分页阅读器/PDF 查看器的首选 |
+| `computer_use_documents` | 开启 | 导出活动文档 URL（`Document` 角色的 ValuePattern），PDF/查看器课件可直接取内容而不必逐页翻 |
+| `computer_use_cdp_probe` | 开启 | 只读探测：窗口是否为 Chromium 宿主、CDP 端点是否可达——用于判定"能不能走 DOM 自动化"（微信 WMPF/Radium 不行） |
 | `click_element`、`scroll_element` | 需显式开启 | 旧版 window-v1 别名 |
 | `session_note`、`session_state`、`diagnostic_state`、`end_turn` | 诊断 | 会话草稿、状态转储与回合控制 |
 
@@ -270,6 +277,7 @@ sequenceDiagram
 | `allowedApps` | `[]` | 非空时只有这些 app id 可被观察或驱动 |
 | `envAllowlist` | `[]` | 在随包允许列表之外额外转发给 helper 的环境变量名 |
 | `overlayCaptureExclusion` | `mask` | 状态药丸如何避开模型看到的截图：`mask`（默认）在单次捕获期间用合成器隐藏药丸，操作者始终能看到；`wda` 改用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`；`off` 不排除，药丸会出现在截图里 |
+| `fallbackLatchAfterWedge` | `true` | 某应用第一次楔死后，本会话余下时间直接用 .NET UIA 兜底供文本，不再每次都等 helper 的 15s dump 超时 |
 | `safetyDefaultEnabled` | `true` | 从未被显式授权或收回的会话，能力默认是否开启。`false` 则默认关闭并摘掉它的工具 schema |
 | `safetyDenySubagents` | `true` | 是否一律拒绝子代理驱动桌面：子代理的权限范围在启动时就固定，不能从会话内部放宽 |
 | `safetyHideToolSchemasWhenOff` | `true` | 能力关闭时是否摘掉工具 schema（已注册工具的 schema 随该会话的每个请求一起发出去） |
@@ -406,6 +414,16 @@ docs/                   插件说明与图片资源
 本插件对标的基线是 Codex Computer Use 插件 `26.903.61454`：相同的 13 个方法、相同的参数名与默认值、相同的返回体、相同的错误串、相同的 AX 树语法、相同的预算、相同的覆盖层语义。
 
 DSH官方的Computer Use采用设计思路不大一致。如果希望使用Codex风格的功能，可以使用本插件。
+
+### 截图需要窗口"有变化"（静态窗口）
+
+`Windows.Graphics.Capture` 只在目标窗口**发生重绘**时给帧。静态页面——考试答题页、设置对话框、停住的文档——会直接 `window capture timed out`；没有帧就拿不到坐标输入。插件用三招兜：
+
+- Chromium 宿主上 `get_window_state` 只取文本（`include_text: true`、不要截图）时**完全不走捕获通道**，直接读 .NET UIA 兜底，同时仍然拿到有效观察租约。
+- `get_window_state` 遇到捕获超时会**降级成纯文本**并返回 `captureFailed: true` + 提示，而不是整个调用失败。
+- `uia_act` 按元素名用 UIA pattern 操作控件，既不需要帧也不需要坐标——WebView2 里的表单/考试界面走这条最稳。
+
+另外，**比桌面还大**的窗口同样合成不了；先把它缩到屏幕内再期待截图。
 
 
 ---

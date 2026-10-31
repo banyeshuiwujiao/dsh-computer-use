@@ -186,6 +186,13 @@ flowchart TB
 |---|---|---|
 | `batch_actions` | enabled | Deterministic actions in one call, then one `get_window_state` |
 | `computer_use_health` | always | Backend, allow list, documentation gate, environment audit |
+| `uia_act` | enabled | Act on a control **by element name** through UIA patterns (`SelectionItem`/`Invoke`/`LegacyIAccessible`); no screenshot and no coordinates, so it also works on static windows WGC cannot capture. Chain steps with `"A、选项|下一题"`; returns the resulting text tree |
+| `wait` | enabled | Fixed delay (optionally re-observing) without a helper round trip |
+| `wait_until` | enabled | Poll until text appears in the accessibility tree, or until the screenshot changes, or until a timeout |
+| `scroll_to` | enabled | Scroll to bottom/top/an approximate percent by issuing several sequential wheel pulses (70 ms apart, because apps coalesce rapid pulses) |
+| `reach_last_page` | enabled | Scroll to the last page with a larger pulse budget — the one call for paginated viewers/PDF readers |
+| `computer_use_documents` | enabled | Export live document URLs (`Document` role ValuePattern) so PDF/viewer courseware can be read without scrolling page by page |
+| `computer_use_cdp_probe` | enabled | Detect whether a window is a Chromium host and whether a CDP endpoint is reachable — read-only, tells you when DOM automation is impossible (WeChat WMPF/Radium) |
 | `click_element`, `scroll_element` | opt-in | Legacy window-v1 aliases |
 | `session_note`, `session_state`, `diagnostic_state`, `end_turn` | diagnostic | Session scratchpad, state dump and turn control |
 
@@ -273,6 +280,7 @@ findings live in [`docs/design-essence-dsh-computer-use.md`](docs/design-essence
 | `allowedApps` | `[]` | Non-empty means only these app ids may be observed or driven |
 | `envAllowlist` | `[]` | Extra environment names forwarded to the helper on top of the shipped allow list |
 | `overlayCaptureExclusion` | `mask` | How the status pill is kept out of the model's screenshots: `mask` hides it in the compositor for the duration of one capture (you keep seeing it), `wda` applies `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` instead, `off` leaves the pill in the frame |
+| `fallbackLatchAfterWedge` | `true` | After the first accessibility wedge for an app, serve text from the .NET UIA fallback for the rest of the session instead of waiting out the helper's 15 s dump timeout each time |
 | `safetyDefaultEnabled` | `true` | Whether the capability is on for a session that was never explicitly granted or revoked. `false` closes it by default and hides its tool schemas |
 | `safetyDenySubagents` | `true` | Refuse computer control to delegated subagents: a subagent's scope is fixed when it starts and cannot be widened from inside the session |
 | `safetyHideToolSchemasWhenOff` | `true` | Hide the tool schemas of a session whose capability is off (a registered tool's schema rides along with every request) |
@@ -415,6 +423,16 @@ docs/                   plugin readmes and assets
 The plugin targets the Codex Computer Use plugin baseline `26.903.61454`: same 13 methods, same parameter names and defaults, same return shapes, same error strings, same AX tree grammar, same budgets, same overlay semantics.
 
 The official DSH Computer Use follows a noticeably different design. Use this plugin when you want the Codex-style behaviour.
+
+### Capture needs a repaint (static windows)
+
+`Windows.Graphics.Capture` delivers a frame only when the target window **changes**. A static page — an exam form, a settings dialog, a paused document — can therefore time out with `window capture timed out`, and coordinate input is impossible without a frame. The plugin handles this in three ways:
+
+- `get_window_state` with `include_text` and **no** screenshot on a Chromium host reads the .NET UIA fallback directly and never touches the capture path (also earns a valid observation lease).
+- `get_window_state` turns a capture timeout into a text-only answer plus `captureFailed: true` and a guidance line, instead of failing the call.
+- `uia_act` drives controls by name through UIA patterns, which needs neither a frame nor coordinates — the reliable path for form/exam UIs in WebView2 hosts.
+
+A window bigger than the desktop also cannot be composited; resize it to fit before expecting screenshots.
 
 ---
 
