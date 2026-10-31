@@ -1145,8 +1145,17 @@ export function uiaActTool(ctx, state) {
       if (!steps.length) throw new Error('names is required (use "|" to chain several steps)')
       const acted = []
       for (const step of steps) {
-        const res = uiaActFallback(hwnd, step, args && args.action)
-        acted.push({ name: step, ok: Boolean(res && res.ok), action: res && res.action, matched: res && res.matched, error: res && res.error })
+        const res = uiaActFallback(hwnd, step, args && args.action) || {}
+        // Every field must be a defined JSON value: an `undefined` member makes the
+        // harness reject the whole result as "not lossless JSON".
+        const row = {
+          name: step,
+          ok: res.ok === true,
+          action: typeof res.action === 'string' ? res.action : 'none',
+          matched: typeof res.matched === 'string' ? res.matched : '',
+        }
+        if (res.error) row.error = String(res.error)
+        acted.push(row)
         // Let the page settle between steps (select → next happens on click).
         await new Promise((resolve) => setTimeout(resolve, 260))
       }
